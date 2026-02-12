@@ -1,0 +1,5 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "bun run build",
+  "outputDirectory": "apps/test-app/.next"
+}
