@@ -124,7 +124,7 @@ next-blog/
 - **UI Framework**: Preact for dashboard, React for plugins
 
 ## 🚀 Quick Start
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fcaptadexp%2Fnext-blog&project-name=next-blog-xyz&repository-name=next-blog&root-directory=apps%2Ftest-app&envLink=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog%23-production-deployment&demo-title=Next-Blog&demo-description=Enterprise-Grade%20Headless%20CMS%20%26%20Plugin%20Platform&demo-image=https%3A%2F%2Fraw.githubusercontent.com%2Fcaptadexp%2Fnext-blog%2Fmain%2Fimages%2Fdashboard.png)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog%2Ftesting-vercel-deploy-button&project-name=next-blog-xyz&repository-name=next-blog&root-directory=apps%2Ftest-app&envLink=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog%23-production-deployment&demo-title=Next-Blog&demo-description=Enterprise-Grade+Headless+CMS+%26+Plugin+Platform&demo-image=https%3A%2F%2Fraw.githubusercontent.com%2Fcaptadexp%2Fnext-blog%2Fmain%2Fimages%2Fdashboard.png&teamSlug=s-dhruvs-projects)
 
 
 ### Installation
@@ -318,7 +318,7 @@ Configuration is handled through the database provider in your route setup.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/next-blog.git
+git clone https://github.com/S-Dhruv/next-blog.git
 cd next-blog
 
 # Install dependencies
