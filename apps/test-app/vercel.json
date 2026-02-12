@@ -1,5 +1,5 @@
 {
-  "framework": "nextjs",
-  "buildCommand": "bash vercel-special-deploy.sh",
-  "installCommand": "bun install"
+  "buildCommand": "bun install && bun run build",
+  "outputDirectory": "apps/test-app/.next",
+  "framework": "nextjs"
 }
