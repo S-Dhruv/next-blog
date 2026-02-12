@@ -29,5 +29,5 @@ fi
 # Build plugins
 bun build-plugins.ts
 
-# Run Next.js build using the binary from the root workspace
-../../node_modules/.bin/next build
+# Run Next.js build using bun
+bun run build
