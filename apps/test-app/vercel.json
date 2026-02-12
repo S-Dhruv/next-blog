@@ -1,6 +1,6 @@
 {
   "framework": "nextjs",
-  "installCommand": "bun install",
-  "buildCommand": "cd ../.. && bun run app:build",
+  "installCommand": "echo 'Skipping install, handled in build script'",
+  "buildCommand": "bash vercel-special-deploy.sh",
   "outputDirectory": ".next"
 }
