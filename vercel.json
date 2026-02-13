@@ -1,7 +1,8 @@
 {
-  "version": 2,
-  "framework": "nextjs",
-  "buildCommand": "bun run build && cd apps/test-app && bun run build",
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "installCommand": "bun install",
-  "outputDirectory": "apps/test-app/.next"
+  "buildCommand": "bun run build && cd apps/test-app && bun run build",
+  "outputDirectory": "apps/test-app/.next",
+  "framework": null,
+  "rewrites": [{ "source": "/(.*)", "destination": "/" }]
 }

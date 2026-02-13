@@ -7,7 +7,7 @@
     "prebuild": "bun prebuild.ts",
     "build-plugins": "bun build-plugins.ts",
     "dev": "PORT=3248 next dev",
-    "build": "bun run prebuild && bun run build-plugins && next build",
+    "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
