@@ -1,7 +1,7 @@
 {
   "version": 2,
   "framework": "nextjs",
-  "buildCommand": "bun run app:build",
+  "buildCommand": "bun run build",
   "installCommand": "bun install",
   "outputDirectory": "apps/test-app/.next"
 }
