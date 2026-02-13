@@ -3,5 +3,5 @@
   "framework": "nextjs",
   "buildCommand": "bun run app:build",
   "installCommand": "bun install",
-  "outputDirectory": "apps/test-app/.next"
+  "outputDirectory": "apps/test-app/"
 }
