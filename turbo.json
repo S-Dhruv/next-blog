@@ -77,7 +77,7 @@
         "^build"
       ]
     },
-    "test-app#build": {
+    "@apps/test-app#build": {
       "dependsOn": [
         "@supergrowthai/next-blog#build",
         "@supergrowthai/next-blog-ui#build",
