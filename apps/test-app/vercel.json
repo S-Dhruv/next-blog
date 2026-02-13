@@ -1,5 +1,5 @@
-{
-  "buildCommand": "bun install && bun run build",
-  "outputDirectory": "apps/test-app/.next",
-  "framework": "nextjs"
-}
+//{
+//  "buildCommand": "bun install && bun run build",
+//  "outputDirectory": "apps/test-app/.next",
+//  "framework": "nextjs"
+//}
