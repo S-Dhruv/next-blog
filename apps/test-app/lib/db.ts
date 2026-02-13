@@ -25,12 +25,15 @@ if (useMongo) {
     console.log("Using MongoDBAdapter.");
 } else {
     // Use FileDBAdapter for local development by default
-    const dataPath = path.join(process.cwd(), 'blog-data');
+    const isVercel = process.env.VERCEL === "1";
+    const basePath = isVercel ? "/tmp" : process.cwd();
+    const dataPath = path.join(basePath, 'blog-data');
+    
     if (!fs.existsSync(dataPath)) {
         fs.mkdirSync(dataPath, {recursive: true});
     }
     dbProvider = async () => new adapters.FileDBAdapter(`${dataPath}/`);
-    console.log("Using FileDBAdapter for local development. Set MONGO_DB_URL to use MongoDB locally.");
+    console.log(`Using FileDBAdapter at ${dataPath}. Set MONGO_DB_URL to use MongoDB.`);
 }
 
 export {dbProvider};
