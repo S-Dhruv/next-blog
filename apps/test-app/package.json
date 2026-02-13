@@ -4,8 +4,10 @@
   "private": true,
   "scripts": {
     "clean": "rimraf .next",
+    "prebuild": "bun prebuild.ts",
+    "build-plugins": "bun build-plugins.ts",
     "dev": "PORT=3248 next dev",
-    "build": "next build",
+    "build": "bun run prebuild && bun run build-plugins && next build",
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
