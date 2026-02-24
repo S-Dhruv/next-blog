@@ -51,10 +51,10 @@ taskQueue.register('email-queue', 'send-email', {
     async onTask(task, actions) {
         try {
             await sendEmail(task.payload.to, task.payload.subject);
-            actions.success(task);
+            actions.success(task, { messageId: 'abc-123' });
         } catch (error) {
             console.error('Failed to send email:', error);
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 });
@@ -164,7 +164,7 @@ const emailExecutor: ISingleTaskNonParallel<EmailData> = {
             actions.success(task);
         } catch (error) {
             console.error('Email sending failed:', error);
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -189,10 +189,10 @@ const imageProcessorExecutor: ISingleTaskParallel<ImageData> = {
     async onTask(task, actions) {
         try {
             await processImage(task.payload.imageUrl, task.payload.filters);
-            actions.success(task);
+            actions.success(task, { processedUrl: task.payload.imageUrl });
         } catch (error) {
             console.error('Image processing failed:', error);
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -221,7 +221,7 @@ const batchProcessorExecutor: IMultiTaskExecutor<BatchData> = {
                 actions.success(task);
             } catch (error) {
                 console.error('Batch item failed:', error);
-                actions.fail(task);
+                actions.fail(task, error instanceof Error ? error : String(error));
 
                 // Optionally add retry tasks
                 if ((task.retries || 0) < 3) {
@@ -245,13 +245,30 @@ For long-running tasks that might exceed normal timeouts:
 
 ```typescript
 import {AsyncTaskManager} from '@supergrowthai/tq';
+import type {AsyncTaskManagerOptions} from '@supergrowthai/tq';
 
-// Set up async task manager
-const asyncTaskManager = new AsyncTaskManager(5);  // maxTasks parameter
+// Simple usage (backward-compatible)
+const asyncTaskManager = new AsyncTaskManager(10); // maxTasks shorthand
 
-// Graceful shutdown with AbortSignal
-const abortController = new AbortController();
-await asyncTaskManager.shutdown(abortController.signal);
+// Full options
+const asyncTaskManager = new AsyncTaskManager({
+    maxTasks: 10,
+    sweepIntervalMs: 5000,          // How often to check for hung tasks (default: 5s)
+    defaultMaxDurationMs: 600000,   // Max task duration before eviction (default: 10 min)
+    shutdownGracePeriodMs: 15000,   // Grace period on shutdown (default: 10s)
+    onTaskTimeout: (taskId, task, durationMs) => {
+        console.error(`Task ${taskId} (${task.type}) timed out after ${durationMs}ms`);
+    }
+});
+
+// Observability
+const metrics = asyncTaskManager.getMetrics();
+// { activeTaskCount, totalHandedOff, totalCompleted, totalRejected,
+//   totalTimedOut, oldestTaskMs, maxTasks, utilizationPercent }
+
+// Graceful shutdown — returns ShutdownResult
+const result = await asyncTaskManager.shutdown(abortController.signal);
+console.log(`Completed: ${result.completedDuringGrace}, Abandoned: ${result.abandonedTaskIds}`);
 
 const heavyProcessingExecutor: ISingleTaskNonParallel<ProcessingData> = {
     multiple: false,
@@ -268,9 +285,9 @@ const heavyProcessingExecutor: ISingleTaskNonParallel<ProcessingData> = {
         try {
             // This might take a very long time
             const result = await performHeavyComputation(task.payload);
-            actions.success(task);
+            actions.success(task, result);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -284,6 +301,12 @@ const taskHandler = new TaskHandler(
     asyncTaskManager  // Now tasks can be handed off to async processing
 );
 ```
+
+Key features:
+- **Stale task sweep**: Periodically evicts tasks exceeding `defaultMaxDurationMs`
+- **Duplicate rejection**: Rejects handoff if the same task ID is already tracked
+- **Shutdown-aware gate**: Stops accepting new tasks once `shutdown()` is called
+- **Observability**: `getMetrics()` exposes utilization, counters, and oldest task age
 
 ## Lifecycle Callbacks
 
@@ -437,7 +460,7 @@ const resilientExecutor: ISingleTaskNonParallel<ApiCallData> = {
             const response = await callExternalAPI(task.payload.endpoint, task.payload.data);
 
             if (response.status === 200) {
-                actions.success(task);
+                actions.success(task, { status: response.status });
             } else {
                 throw new Error(`API returned status: ${response.status}`);
             }
@@ -455,12 +478,49 @@ const resilientExecutor: ISingleTaskNonParallel<ApiCallData> = {
                     execute_at: new Date(Date.now() + retryDelay)
                 }]);
             } else {
-                actions.fail(task);
+                actions.fail(task, error instanceof Error ? error : String(error), { attempt: currentRetries + 1 });
             }
         }
     }
 };
 ```
+
+## Task Result Persistence
+
+Executors can persist structured results on task completion or failure via `ExecutorActions`:
+
+```typescript
+// Store result on success — saved to task.execution_result (256 KB limit)
+actions.success(task, { outputUrl: 'https://cdn.example.com/result.pdf', pages: 42 });
+
+// Store error details on failure — saved to task.execution_stats
+actions.fail(task, new Error('Upstream timeout'), { endpoint: '/api/render', latencyMs: 30000 });
+```
+
+Results are stored by the `TaskRunner` and persisted via your `ITaskStorageAdapter`. Oversized results (>256 KB serialized) are silently dropped to protect storage.
+
+### Executor-Level Partition Key
+
+Executors can declare a `getPartitionKey` function to control Kinesis partition routing for ordering guarantees:
+
+```typescript
+taskQueue.register('order-queue', 'process-order', {
+    multiple: false,
+    parallel: false,
+    default_retries: 3,
+    store_on_failure: true,
+
+    // All tasks for the same user land on the same Kinesis shard
+    getPartitionKey: (task) => task.payload.user_id,
+
+    async onTask(task, actions) {
+        await processOrder(task.payload);
+        actions.success(task, { orderId: task.payload.order_id });
+    }
+});
+```
+
+The returned value is set as `partition_key` on the message, overriding the default Kinesis partition routing.
 
 ## Working with Different Queue Providers
 
@@ -522,7 +582,7 @@ kinesisTaskQueue.register('real-time', 'notification', notificationExecutor);
 Full TypeScript definitions with generic task types:
 
 ```typescript
-import type {TaskExecutor, ExecutorActions, CronTask} from '@supergrowthai/tq';
+import type {TaskExecutor, ExecutorActions, CronTask, AsyncTaskManagerOptions, ShutdownResult} from '@supergrowthai/tq';
 
 // Define your task data type
 interface EmailTaskData {
@@ -550,7 +610,7 @@ const typedExecutor: ISingleTaskNonParallel<EmailTaskData> = {
             await sendEmail(task.payload);
             actions.success(task);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -597,7 +657,7 @@ await mongoClient.connect();
 
 const messageQueue = new ProductionMongoDBQueue(cacheProvider, mongoClient);
 const taskQueue = new TaskQueuesManager(messageQueue);
-const asyncTaskManager = new AsyncTaskManager(10); // maxTasks: 10 concurrent async tasks
+const asyncTaskManager = new AsyncTaskManager({ maxTasks: 10 }); // See AsyncTaskManagerOptions
 
 const taskHandler = new TaskHandler(
     messageQueue,
@@ -642,7 +702,7 @@ const idempotentExecutor: ISingleTaskNonParallel<UserUpdateData> = {
             await updateUser(task.payload.userId, task.payload.updates);
             actions.success(task);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -668,7 +728,7 @@ const apiExecutor: ISingleTaskParallel<ApiTaskData> = {
             const result = await callAPI(task.payload);
             actions.success(task);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         } finally {
             rateLimiter.release();
         }

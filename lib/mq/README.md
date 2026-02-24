@@ -130,6 +130,40 @@ const messageQueue = new KinesisQueue({
 });
 ```
 
+#### Adaptive Processing Strategy
+
+`KinesisQueue` supports an optional `IAdaptiveStrategy` for dynamic batch size and backoff control per shard. The built-in `AIMDStrategy` (Additive Increase / Multiplicative Decrease) adjusts automatically based on success/failure rates:
+
+```typescript
+import {KinesisQueue, AIMDStrategy, FileShardLockProvider} from '@supergrowthai/mq';
+
+const messageQueue = new KinesisQueue({
+    shardLockProvider: new FileShardLockProvider(),
+    instanceId: 'worker-1',
+    adaptiveStrategy: new AIMDStrategy({
+        minBatch: 10,           // Floor for batch size (default: 10)
+        maxBatch: 500,          // Ceiling for batch size (default: 500)
+        addStep: 10,            // Batch size increase per M successes (default: 10)
+        decreaseFactor: 0.5,    // Batch size multiplier on failure (default: 0.5)
+        backoffThreshold: 10,   // Consecutive errors before circuit-breaker (default: 10)
+    })
+});
+```
+
+Without a strategy, `KinesisQueue` uses fixed defaults. You can implement `IAdaptiveStrategy` for custom logic:
+
+```typescript
+import type {IAdaptiveStrategy, BatchResult, AdaptiveSnapshot} from '@supergrowthai/mq';
+
+class MyStrategy implements IAdaptiveStrategy {
+    getBatchSize(shardId: string): number { /* ... */ }
+    getProcessingDelay(shardId: string): number { /* ... */ }
+    shouldBackoff(shardId: string): boolean { /* ... */ }
+    recordBatchResult(result: BatchResult): void { /* ... */ }
+    getSnapshot(shardId?: string): AdaptiveSnapshot { /* ... */ }
+}
+```
+
 ## Shard Lock Providers
 
 For Kinesis queues, you need to provide a shard lock provider:
@@ -446,11 +480,37 @@ import {
     MessageConsumer,
     IShardLockProvider,
     QueueName,
-    QueueNotifier
+    QueueNotifier,
+    AIMDStrategy
+} from '@supergrowthai/mq';
+
+import type {
+    IAdaptiveStrategy,
+    BatchResult,
+    AdaptiveSnapshot
 } from '@supergrowthai/mq';
 
 // All interfaces are fully typed for excellent IDE support
 ```
+
+### `BaseMessage` Fields
+
+Messages include an optional `partition_key` field to override Kinesis partition routing:
+
+```typescript
+const message: BaseMessage = {
+    type: 'process-order',
+    payload: { orderId: '123', userId: 'u-456' },
+    execute_at: new Date(),
+    status: 'scheduled',
+    created_at: new Date(),
+    updated_at: new Date(),
+    queue_id: 'order-queue',
+    partition_key: 'u-456'  // Routes to same Kinesis shard for ordering
+};
+```
+
+When `partition_key` is set, it overrides the default partition routing (which uses `message.type`). This is typically set by executor-level `getPartitionKey` in `@supergrowthai/tq` rather than manually.
 
 ## License
 
