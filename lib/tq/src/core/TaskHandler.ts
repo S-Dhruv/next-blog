@@ -26,6 +26,8 @@ import type {
     WorkerInfo,
     WorkerStats
 } from "./lifecycle.js";
+import type {IEntityProjectionProvider, EntityTaskProjection} from "./entity/IEntityProjectionProvider.js";
+import {buildProjection, syncProjections} from "./entity/IEntityProjectionProvider.js";
 import * as os from "os";
 
 const METRICS_KEY_PREFIX = 'task_metrics:';
@@ -90,7 +92,9 @@ export class TaskHandler<ID> {
             this.cacheAdapter,
             databaseAdapter.generateId.bind(databaseAdapter),
             this.config.lifecycleProvider,
-            this.config.lifecycle
+            this.config.lifecycle,
+            this.config.entityProjection,
+            this.config.entityProjectionConfig
         );
     }
 
@@ -102,6 +106,10 @@ export class TaskHandler<ID> {
 
     private get workerProvider(): IWorkerLifecycleProvider | undefined {
         return this.config.workerProvider;
+    }
+
+    private get entityProjectionProvider(): IEntityProjectionProvider | undefined {
+        return this.config.entityProjection;
     }
 
     /**
@@ -141,6 +149,9 @@ export class TaskHandler<ID> {
     async addTasks(tasks: CronTask<ID>[]) {
         // Validate log_context on all tasks (RFC-005)
         tasks = tasks.map(t => this.validateLogContext(t));
+
+        // RFC-003: Collect enriched (ID-bearing) tasks for entity projection
+        const enrichedTasks: CronTask<ID>[] = [];
 
         const diffedItems = tasks.reduce(
             (acc, {force_store, ...task}) => {
@@ -185,6 +196,7 @@ export class TaskHandler<ID> {
                 });
 
             await this.messageQueue.addMessages(queue, queueTasks as unknown as CronTask<ID>[]);
+            enrichedTasks.push(...queueTasks);
 
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
@@ -234,6 +246,8 @@ export class TaskHandler<ID> {
                 throw mqError;
             }
 
+            enrichedTasks.push(...queueTasks);
+
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
                 for (const task of queueTasks) {
@@ -256,6 +270,7 @@ export class TaskHandler<ID> {
                     return ({...id, ...task});
                 });
             await this.taskStore.addTasksToScheduled(queueTasks);
+            enrichedTasks.push(...queueTasks);
 
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
@@ -265,6 +280,20 @@ export class TaskHandler<ID> {
                         this.buildTaskContext(task)
                     );
                 }
+            }
+        }
+
+        // RFC-003: Emit 'scheduled' entity projections for enriched (ID-bearing) entity tasks
+        if (this.entityProjectionProvider) {
+            try {
+                const includePayload = this.config.entityProjectionConfig?.includePayload;
+                const entityProjections = enrichedTasks
+                    .filter(t => t.entity)
+                    .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                    .filter((p): p is EntityTaskProjection => p !== null);
+                await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+            } catch (err) {
+                this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
             }
         }
     }
@@ -279,7 +308,7 @@ export class TaskHandler<ID> {
                            }: ProcessedTaskResult<ID>) {
         const tasksToRetry: CronTask<ID>[] = [];
         const finalFailedTasks: CronTask<ID>[] = [];
-        let discardedTasksCount = 0;
+        const discardedTasks: CronTask<ID>[] = [];
 
         // Maximum retry delay cap to prevent unbounded delays
         const MAX_RETRY_DELAY_MS = 5 * 60 * 1000; // 5 minutes
@@ -329,7 +358,7 @@ export class TaskHandler<ID> {
                     }]);
                 }
             } else {
-                discardedTasksCount++;
+                discardedTasks.push(task);
                 this.logger.info(`Discarding task of type ${task.type} after ${taskRetryCount} retries`);
 
                 // Emit onTaskExhausted for discarded tasks
@@ -353,8 +382,8 @@ export class TaskHandler<ID> {
             }
         }
 
-        if (discardedTasksCount > 0) {
-            await this.trackDiscardedTasks(discardedTasksCount);
+        if (discardedTasks.length > 0) {
+            await this.trackDiscardedTasks(discardedTasks.length);
         }
 
         if (tasksToRetry.length > 0) {
@@ -371,6 +400,49 @@ export class TaskHandler<ID> {
 
         if (successTasks.length > 0) {
             await this.taskStore.markTasksAsSuccess(successTasks);
+        }
+
+        // RFC-003: Emit terminal entity projections
+        if (this.entityProjectionProvider) {
+            try {
+                const includePayload = this.config.entityProjectionConfig?.includePayload;
+                const terminalProjections: EntityTaskProjection[] = [];
+
+                // Success tasks → 'executed'
+                for (const task of successTasks) {
+                    const p = buildProjection(task, 'executed', {
+                        includePayload,
+                        result: task.execution_result,
+                    });
+                    if (p) terminalProjections.push(p);
+                }
+
+                // Final failed tasks (with id, exhausted retries) → 'failed'
+                for (const task of finalFailedTasks) {
+                    const p = buildProjection(task, 'failed', {
+                        includePayload,
+                        error: task.execution_stats?.last_error as string || 'Task failed',
+                    });
+                    if (p) terminalProjections.push(p);
+                }
+
+                // Discarded tasks (no id, exhausted retries) → 'failed'
+                for (const task of discardedTasks) {
+                    try {
+                        const p = buildProjection(task, 'failed', {
+                            includePayload,
+                            error: task.execution_stats?.last_error as string || 'Task exhausted all retries',
+                        });
+                        if (p) terminalProjections.push(p);
+                    } catch (projErr) {
+                        this.logger.error(`[TQ] Entity projection build failed (non-fatal): ${projErr}`);
+                    }
+                }
+
+                await syncProjections(terminalProjections, this.entityProjectionProvider, this.logger);
+            } catch (err) {
+                this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+            }
         }
     }
 

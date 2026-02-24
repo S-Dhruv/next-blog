@@ -15,6 +15,8 @@ import {IAsyncTaskManager} from "./async/async-task-manager";
 import type {ITaskLifecycleProvider, TaskContext, TaskHandlerLifecycleConfig, TaskTiming} from "./lifecycle.js";
 import {runWithLogContext} from "./log-context.js";
 import type {LogStore} from "./log-context.js";
+import type {IEntityProjectionProvider, EntityProjectionConfig, EntityTaskProjection} from "./entity/IEntityProjectionProvider.js";
+import {buildProjection, syncProjections} from "./entity/IEntityProjectionProvider.js";
 
 export interface AsyncTask<ID> {
     task: CronTask<ID>;
@@ -35,7 +37,9 @@ export class TaskRunner<ID> {
         cacheProvider: CacheProvider<any>,
         private generateId: () => ID,
         private lifecycleProvider?: ITaskLifecycleProvider,
-        private lifecycleConfig?: TaskHandlerLifecycleConfig
+        private lifecycleConfig?: TaskHandlerLifecycleConfig,
+        private entityProjection?: IEntityProjectionProvider<ID>,
+        private entityProjectionConfig?: EntityProjectionConfig
     ) {
         this.logger = new Logger('TaskRunner', LogLevel.INFO);
         this.lockManager = new LockManager(cacheProvider, {
@@ -117,6 +121,19 @@ export class TaskRunner<ID> {
         }, [] as { type: TaskType, tasks: CronTask<ID>[] }[]);
 
         this.logger.info(`[${taskRunnerId}] Task groups: ${groupedTasksArray.map(g => `${g.type}: ${g.tasks.length}`).join(', ')}`);
+
+        // RFC-003: Emit 'processing' projection for first-attempt entity tasks
+        if (this.entityProjection) {
+            try {
+                const processingProjections = tasks
+                    .filter(t => t.entity && !t.execution_stats?.retry_count)
+                    .map(t => buildProjection(t, 'processing', {includePayload: this.entityProjectionConfig?.includePayload}))
+                    .filter((p): p is EntityTaskProjection<ID> => p !== null);
+                await syncProjections(processingProjections, this.entityProjection, this.logger);
+            } catch (err) {
+                this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+            }
+        }
 
         const actions = new Actions<ID>(taskRunnerId);
         const asyncTasks: AsyncTask<ID>[] = [];
@@ -315,7 +332,7 @@ export class TaskRunner<ID> {
                                             this.emitTaskFailed(t, taskRunnerId, error, willRetry);
                                         }
                                     } : undefined;
-                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId, asyncLifecycleEmitter);
+                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId, asyncLifecycleEmitter, this.entityProjection, this.entityProjectionConfig);
 
                                     const asyncPromise = taskPromise
                                         .finally(async () => {

@@ -2,6 +2,7 @@
  * Task Queue Lifecycle Types
  * Provides interfaces for task and worker lifecycle callbacks
  */
+import type {EntityProjectionConfig, IEntityProjectionProvider} from "./entity/IEntityProjectionProvider.js";
 
 // ============ Task Lifecycle Types ============
 
@@ -155,4 +156,8 @@ export interface TaskHandlerConfig {
     workerProvider?: IWorkerLifecycleProvider;
     /** Lifecycle callback configuration */
     lifecycle?: TaskHandlerLifecycleConfig;
+    /** RFC-003: Entity-task projection provider */
+    entityProjection?: IEntityProjectionProvider;
+    /** RFC-003: Entity projection configuration */
+    entityProjectionConfig?: EntityProjectionConfig;
 }

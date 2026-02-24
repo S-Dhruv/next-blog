@@ -30,7 +30,8 @@ class TaskStore<ID> {
             processing_started_at: task.processing_started_at || new Date(),
             force_store: task.force_store,
             metadata: task.metadata,
-            partition_key: task.partition_key
+            partition_key: task.partition_key,
+            entity: task.entity
         })) as CronTask<ID>[];
 
         return await this.databaseAdapter.addTasksToScheduled(transformedTasks);

@@ -6,6 +6,8 @@ import {tId} from "../../utils/task-id-gen.js";
 import {CronTask} from "../../adapters";
 import {TaskQueuesManager} from "../TaskQueuesManager.js";
 import {computeRetryDecision} from "./retry-utils.js";
+import type {IEntityProjectionProvider, EntityProjectionConfig, EntityTaskProjection} from "../entity/IEntityProjectionProvider.js";
+import {buildProjection, syncProjections} from "../entity/IEntityProjectionProvider.js";
 
 const logger = new Logger('AsyncActions', LogLevel.INFO);
 
@@ -29,7 +31,9 @@ export class AsyncActions<ID = any> {
         actions: Actions<ID>,
         private task: CronTask<ID>,
         private generateId: () => ID,
-        private lifecycleEmitter?: AsyncLifecycleEmitter
+        private lifecycleEmitter?: AsyncLifecycleEmitter,
+        private entityProjection?: IEntityProjectionProvider<ID>,
+        private entityProjectionConfig?: EntityProjectionConfig
     ) {
         this.actions = actions;
         this.taskId = tId(task);
@@ -86,6 +90,18 @@ export class AsyncActions<ID = any> {
                         }
                     }
                 }
+
+                // RFC-003: Emit 'executed' entity projections for async success tasks
+                await syncProjections(
+                    results.successTasks
+                        .map(t => buildProjection(t, 'executed', {
+                            includePayload: this.entityProjectionConfig?.includePayload,
+                            result: t.execution_result,
+                        }))
+                        .filter((p): p is EntityTaskProjection<ID> => p !== null),
+                    this.entityProjection,
+                    logger
+                );
             } catch (err) {
                 logger.error(`[AsyncActions] Failed to mark tasks as success:`, err);
                 throw err;
@@ -113,6 +129,14 @@ export class AsyncActions<ID = any> {
         } else {
             logger.info(`[AsyncActions] Async task ${this.taskId} exhausted retries, marking as failed`);
             await this.taskStore.markTasksAsFailed([failedTask]);
+
+            // RFC-003: Emit 'failed' entity projection for final-failed async tasks
+            const errorMsg = failedTask.execution_stats?.last_error as string || 'Task failed';
+            const p = buildProjection(failedTask, 'failed', {
+                includePayload: this.entityProjectionConfig?.includePayload,
+                error: errorMsg,
+            });
+            if (p) await syncProjections([p], this.entityProjection, logger);
         }
 
         if (this.lifecycleEmitter) {

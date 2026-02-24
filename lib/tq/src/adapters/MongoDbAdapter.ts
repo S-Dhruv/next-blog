@@ -93,7 +93,8 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
             execution_stats: task.execution_stats,
             force_store: task.force_store,
             metadata: task.metadata,
-            partition_key: task.partition_key
+            partition_key: task.partition_key,
+            entity: task.entity
         }));
 
         try {

@@ -8,4 +8,6 @@ export type CronTask<ID = any> = BaseMessage<ID> & {
     task_hash?: string
     /** Result returned by executor via actions.success(task, result) */
     execution_result?: unknown
+    /** Optional entity binding for RFC-003 entity-task projection */
+    entity?: { id: string; type: string }
 }

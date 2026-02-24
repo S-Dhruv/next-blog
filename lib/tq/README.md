@@ -12,6 +12,7 @@ Built on top of `@supergrowthai/mq` for flexible message queue backends.
 - **Queue Integration**: Works with any message queue backend via `@supergrowthai/mq`
 - **Named Exports**: Tree-shakable, explicit imports
 - **Fail-Fast Design**: Required dependencies enforce proper configuration
+- **Entity Projection**: Automatic entity-task status tracking for dashboards and orchestration
 
 ## Installation
 
@@ -446,6 +447,122 @@ const taskHandler = new TaskHandler(
 | started_at     | Date     | When worker started      |
 | enabled_queues | string[] | Queues being processed   |
 
+## Entity Task Projection
+
+Track task lifecycle at the entity level without querying internal task tables. Useful for dashboards, customer-facing status pages, and flow orchestration.
+
+### How It Works
+
+Tasks can carry an `entity` binding — an external domain object (e.g., a user, order, or campaign) that the task operates on. When configured, tq automatically projects status transitions to your provider:
+
+```
+scheduled → processing → executed
+                       → failed
+```
+
+Projections are **non-fatal** — provider errors are logged but never disrupt task processing.
+
+### Binding an Entity to a Task
+
+```typescript
+await taskHandler.addTasks([{
+    type: 'generate-report',
+    queue_id: 'reports',
+    execute_at: new Date(),
+    payload: { reportType: 'monthly', userId: 'u_123' },
+
+    // Entity binding — ties this task to a domain object
+    entity: { id: 'u_123', type: 'user' },
+
+    // Entity tasks MUST have a persistent ID for projection keying.
+    // Use store_on_failure: true on the executor, or force_store: true here.
+}]);
+```
+
+**Fail-fast guarantee**: If a task has `entity` but no `id`, `buildProjection()` throws at runtime with an actionable error message pointing to `store_on_failure`, `force_store`, or manual ID assignment. This catches misconfiguration during development, not in production at 3 AM.
+
+### Implementing a Projection Provider
+
+```typescript
+import type {IEntityProjectionProvider, EntityTaskProjection} from '@supergrowthai/tq';
+
+class PostgresProjectionProvider implements IEntityProjectionProvider<string> {
+    async upsertProjections(entries: EntityTaskProjection<string>[]): Promise<void> {
+        // Batch upsert to your projection table
+        await db.query(`
+            INSERT INTO entity_task_projections
+                (task_id, entity_id, entity_type, task_type, queue_id, status,
+                 payload, error, result, created_at, updated_at)
+            VALUES ${entries.map((_, i) => `($${i * 11 + 1}, ...)`).join(', ')}
+            ON CONFLICT (task_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                result = EXCLUDED.result,
+                updated_at = EXCLUDED.updated_at
+        `, entries.flatMap(e => [
+            e.task_id, e.entity_id, e.entity_type, e.task_type, e.queue_id,
+            e.status, e.payload, e.error, e.result, e.created_at, e.updated_at
+        ]));
+    }
+}
+```
+
+### Wiring It Up
+
+```typescript
+const taskHandler = new TaskHandler(
+    messageQueue,
+    taskQueue,
+    databaseAdapter,
+    cacheAdapter,
+    asyncTaskManager,
+    notificationProvider,
+    {
+        lifecycleProvider: myLifecycleProvider,
+        workerProvider: myWorkerProvider,
+
+        // RFC-003: Entity projection
+        entityProjection: new PostgresProjectionProvider(),
+        entityProjectionConfig: {
+            includePayload: false  // default; set true to persist payload in projections
+        }
+    }
+);
+```
+
+### Projection Lifecycle
+
+| Event | Status | When | Where |
+|-------|--------|------|-------|
+| Task added | `scheduled` | After `addTasks()` completes (all 3 routing paths) | `TaskHandler.addTasks` |
+| Worker picks up task | `processing` | Before executor runs (first attempt only, not retries) | `TaskRunner.run` |
+| Task succeeds | `executed` | After `markTasksAsSuccess` | `TaskHandler.postProcessTasks` / `AsyncActions` |
+| Task exhausts retries | `failed` | After `markTasksAsFailed` or discard | `TaskHandler.postProcessTasks` / `AsyncActions` |
+
+### EntityTaskProjection Shape
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | `ID` | Task identifier (required — fail-fast if missing) |
+| `entity_id` | `string` | External entity identifier |
+| `entity_type` | `string` | Entity type (e.g., `'user'`, `'order'`) |
+| `task_type` | `string` | Task type identifier |
+| `queue_id` | `string` | Queue the task belongs to |
+| `status` | `'scheduled' \| 'processing' \| 'executed' \| 'failed'` | Current lifecycle status |
+| `payload` | `unknown?` | Task payload (only if `includePayload: true`) |
+| `error` | `string?` | Error message (only on `failed` status) |
+| `result` | `unknown?` | Execution result (only on `executed` status) |
+| `created_at` | `Date` | Task creation time |
+| `updated_at` | `Date` | Projection update time |
+
+### Design Decisions
+
+- **Non-fatal**: Provider errors are caught and logged. Task processing is never interrupted by projection failures.
+- **Batch-efficient**: All projections within a processing batch are collected and sent in a single `upsertProjections()` call.
+- **No retry-spam**: `processing` projection is only emitted on the first attempt, not on retries.
+- **Async-aware**: Async tasks (via `handoffTimeout`) emit terminal projections from `AsyncActions` when the promise resolves.
+- **Fail-fast on misconfiguration**: Entity tasks without an ID throw immediately with an actionable fix, rather than silently producing broken projections.
+
 ## Error Handling and Retries
 
 ```typescript
@@ -582,7 +699,10 @@ kinesisTaskQueue.register('real-time', 'notification', notificationExecutor);
 Full TypeScript definitions with generic task types:
 
 ```typescript
-import type {TaskExecutor, ExecutorActions, CronTask, AsyncTaskManagerOptions, ShutdownResult} from '@supergrowthai/tq';
+import type {
+    TaskExecutor, ExecutorActions, CronTask, AsyncTaskManagerOptions, ShutdownResult,
+    IEntityProjectionProvider, EntityTaskProjection, EntityProjectionConfig
+} from '@supergrowthai/tq';
 
 // Define your task data type
 interface EmailTaskData {

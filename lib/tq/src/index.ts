@@ -34,6 +34,9 @@ export * from "./core/task-processor-types.js";
 export {runWithLogContext, getLogContext} from "./core/log-context.js";
 export type {LogStore} from "./core/log-context.js";
 
+// Entity projection (RFC-003)
+export * from "./core/entity/index.js";
+
 // Utilities
 export * from "./utils/task-id-gen.js";
 
