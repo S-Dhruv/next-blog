@@ -46,8 +46,10 @@ function validateResultSize(result: unknown): boolean {
 }
 
 function enrichTaskWithResult<ID>(task: CronTask<ID>, result: unknown): CronTask<ID> {
-    if (result === undefined || !validateResultSize(result)) return task;
-    return {...task, execution_result: result};
+    if (result === undefined) return task;
+    if (!validateResultSize(result)) return task;  // caller logs warning
+    task.execution_result = result;  // mutate in place — tasks are already extracted copies
+    return task;
 }
 
 function enrichTaskWithError<ID>(task: CronTask<ID>, error?: Error | string, meta?: Record<string, unknown>): CronTask<ID> {
@@ -61,14 +63,13 @@ function enrichTaskWithError<ID>(task: CronTask<ID>, error?: Error | string, met
         errorFields.last_error = error;
     }
 
-    return {
-        ...task,
-        execution_stats: {
-            ...(task.execution_stats || {}),
-            ...errorFields,
-            ...(meta || {})
-        }
+    // Mutate in place — tasks are already extracted copies
+    task.execution_stats = {
+        ...(task.execution_stats || {}),
+        ...errorFields,
+        ...(meta || {})
     };
+    return task;
 }
 
 export class Actions<ID = any> implements ExecutorActions<ID> {
@@ -243,6 +244,9 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
             // Process all actions
             for (const action of context.actions) {
                 if (action.type === 'success' && action.task) {
+                    if (action.result !== undefined && !validateResultSize(action.result)) {
+                        logger.warn(`[${this.taskRunnerId}] Result for task ${tId(action.task)} exceeds size limit, dropping result`);
+                    }
                     results.successTasks.push(enrichTaskWithResult(action.task, action.result));
                     // If marking a different task, remove its context
                     const targetTaskId = tId(action.task);
@@ -297,6 +301,9 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
                 } else {
                     for (const action of context.actions) {
                         if (action.type === 'success' && action.task) {
+                            if (action.result !== undefined && !validateResultSize(action.result)) {
+                                logger.warn(`[${this.taskRunnerId}] Result for task ${tId(action.task)} exceeds size limit, dropping result`);
+                            }
                             results.successTasks.push(enrichTaskWithResult(action.task, action.result));
                         } else if (action.type === 'fail' && action.task) {
                             results.failedTasks.push(enrichTaskWithError(action.task, action.error, action.meta));

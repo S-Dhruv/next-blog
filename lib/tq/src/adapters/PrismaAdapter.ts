@@ -218,43 +218,30 @@ export class PrismaAdapter<
     }
 
     async markTasksAsExecuted(tasks: CronTask<TId>[]): Promise<void> {
+        const tasksWithIds = tasks.filter(t => t.id);
+        if (!tasksWithIds.length) return;
+
         const now = new Date();
+        const hasAnyResult = tasksWithIds.some(t => t.execution_result !== undefined);
 
-        // Split: tasks with results need per-task ops, rest use efficient batch updateMany
-        const withResults: CronTask<TId>[] = [];
-        const withoutResultIds: TId[] = [];
-
-        for (const t of tasks) {
-            if (!t.id) continue;
-            if (t.execution_result !== undefined) {
-                withResults.push(t);
-            } else {
-                withoutResultIds.push(t.id);
-            }
-        }
-
-        if (!withoutResultIds.length && !withResults.length) return;
-
-        // Fast path: single updateMany for all tasks without results
-        if (withoutResultIds.length > 0) {
-            await this.delegate.updateMany({
-                where: {id: {in: withoutResultIds}},
-                data: {status: 'executed', updated_at: now}
-            });
-        }
-
-        // Slow path: transaction only for tasks that carry a result
-        if (withResults.length > 0) {
+        if (hasAnyResult) {
+            // Any task carries a result → unified $transaction for entire batch (1 round-trip)
             await this.prismaClient.$transaction(
-                withResults.map(t => this.delegate.update({
+                tasksWithIds.map(t => this.delegate.update({
                     where: {id: t.id},
                     data: {
                         status: 'executed',
                         updated_at: now,
-                        execution_result: t.execution_result
+                        ...(t.execution_result !== undefined && {execution_result: t.execution_result})
                     }
                 }))
             );
+        } else {
+            // No results in batch → single updateMany (1 server op, 1 round-trip)
+            await this.delegate.updateMany({
+                where: {id: {in: tasksWithIds.map(t => t.id!)}},
+                data: {status: 'executed', updated_at: now}
+            });
         }
     }
 

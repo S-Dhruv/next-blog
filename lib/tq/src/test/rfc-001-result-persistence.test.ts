@@ -508,9 +508,64 @@ describe("RFC-001: Result Persistence", () => {
         }, 10000);
     });
 
-    // ============ Phase 8: Error Forwarding ============
+    // ============ Phase 8: Unified Write Enforcement ============
 
-    describe("Phase 8: Error forwarding", () => {
+    describe("Phase 8: Unified write enforcement", () => {
+
+        it("mixed batch: tasks with and without results persist correctly through unified write", async () => {
+            const messageQueue = new InMemoryQueue();
+            const databaseAdapter = new InMemoryAdapter();
+            const taskQueue = new TaskQueuesManager<string>(messageQueue);
+            const cacheProvider = new MemoryCacheProvider();
+            const taskHandler = new TaskHandler<string>(messageQueue, taskQueue, databaseAdapter, cacheProvider);
+
+            // 10 tasks: 7 with results, 3 without
+            const tasks: CronTask<string>[] = [];
+            for (let i = 0; i < 10; i++) {
+                tasks.push(makeTask({id: `unified-${i}`, payload: {input: `task-${i}`}}));
+            }
+            await databaseAdapter.addTasksToScheduled(tasks);
+
+            const executor: IMultiTaskExecutor<string, "rfc001-task"> = {
+                multiple: true,
+                store_on_failure: true,
+                onTasks: async (batchTasks, actions) => {
+                    for (let i = 0; i < batchTasks.length; i++) {
+                        if (i < 7) {
+                            actions.success(batchTasks[i], {index: i});
+                        } else {
+                            actions.success(batchTasks[i]); // no result
+                        }
+                    }
+                }
+            };
+
+            taskQueue.register(QUEUE, "rfc001-task", executor);
+
+            await messageQueue.addMessages(QUEUE, tasks);
+            await taskHandler.startConsumingTasks(QUEUE);
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            // Tasks with results: each has its own result, no cross-contamination
+            for (let i = 0; i < 7; i++) {
+                const stored = await databaseAdapter.getTasksByIds([`unified-${i}`]);
+                expect(stored[0].execution_result).toEqual({index: i});
+                expect(stored[0].status).toBe("executed");
+            }
+            // Tasks without results: execution_result absent (not null, not another task's result)
+            for (let i = 7; i < 10; i++) {
+                const stored = await databaseAdapter.getTasksByIds([`unified-${i}`]);
+                expect(stored[0].execution_result).toBeUndefined();
+                expect(stored[0].status).toBe("executed");
+            }
+
+            await messageQueue.shutdown();
+        });
+    });
+
+    // ============ Phase 9: Error Forwarding ============
+
+    describe("Phase 9: Error forwarding", () => {
 
         it("executor crash error appears in execution_stats.last_error", async () => {
             const messageQueue = new InMemoryQueue();

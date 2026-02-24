@@ -173,44 +173,33 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
 
     async markTasksAsExecuted(tasks: CronTask<ObjectId>[]): Promise<void> {
         const collection = await this.collection;
+        const tasksWithIds = tasks.filter(t => t.id);
+        if (!tasksWithIds.length) return;
+
         const now = new Date();
+        const hasAnyResult = tasksWithIds.some(t => t.execution_result !== undefined);
 
-        // Split: tasks with results need per-task ops, rest use efficient batch updateMany
-        const withResults: CronTask<ObjectId>[] = [];
-        const withoutResultIds: ObjectId[] = [];
-
-        for (const t of tasks) {
-            if (!t.id) continue;
-            if (t.execution_result !== undefined) {
-                withResults.push(t);
-            } else {
-                withoutResultIds.push(t.id);
-            }
-        }
-
-        // Fast path: single updateMany for all tasks without results
-        if (withoutResultIds.length > 0) {
-            await collection.updateMany(
-                {_id: {$in: withoutResultIds}},
-                {$set: {status: 'executed', updated_at: now}}
-            );
-        }
-
-        // Slow path: bulkWrite only for tasks that carry a result
-        if (withResults.length > 0) {
-            const bulkOps = withResults.map(t => ({
+        if (hasAnyResult) {
+            // Any task carries a result → unified bulkWrite for entire batch (1 round-trip)
+            const bulkOps = tasksWithIds.map(t => ({
                 updateOne: {
                     filter: {_id: t.id!},
                     update: {
                         $set: {
                             status: 'executed' as const,
                             updated_at: now,
-                            execution_result: t.execution_result
+                            ...(t.execution_result !== undefined && {execution_result: t.execution_result})
                         }
                     }
                 }
             }));
             await collection.bulkWrite(bulkOps, {ordered: false});
+        } else {
+            // No results in batch → single updateMany (1 server op, 1 round-trip)
+            await collection.updateMany(
+                {_id: {$in: tasksWithIds.map(t => t.id!)}},
+                {$set: {status: 'executed', updated_at: now}}
+            );
         }
     }
 
