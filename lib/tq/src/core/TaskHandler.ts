@@ -383,7 +383,13 @@ export class TaskHandler<ID> {
             if (asyncTasks.length > 0) {
                 this.logger.info(`Handling ${asyncTasks.length} async tasks for stream ${streamName}`);
                 for (const asyncTask of asyncTasks) {
-                    const accepted = this.asyncTaskManager!.handoffTask(asyncTask.task, asyncTask.promise);
+                    // Get per-task timeout from executor's asyncConfig
+                    const executor = this.taskQueuesManager.getExecutor(asyncTask.task.queue_id, asyncTask.task.type);
+                    const taskTimeout = executor?.asyncConfig?.handoffTimeout
+                        ? executor.asyncConfig.handoffTimeout * 2
+                        : undefined;
+
+                    const accepted = this.asyncTaskManager!.handoffTask(asyncTask.task, asyncTask.promise, taskTimeout);
                     if (!accepted) {
                         this.logger.warn(`Async queue full, requeueing task ${asyncTask.task.id} with 30s delay`);
                         await this.addTasks([{

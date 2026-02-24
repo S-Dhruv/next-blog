@@ -5,8 +5,18 @@ import {IMessageQueue, QueueName} from "@supergrowthai/mq";
 import {tId} from "../../utils/task-id-gen.js";
 import {CronTask} from "../../adapters";
 import {TaskQueuesManager} from "../TaskQueuesManager.js";
+import {computeRetryDecision} from "./retry-utils.js";
 
 const logger = new Logger('AsyncActions', LogLevel.INFO);
+
+/**
+ * Interface for emitting async task lifecycle events.
+ * Constructed from the sync-path's ITaskLifecycleProvider by TaskRunner.
+ */
+export interface AsyncLifecycleEmitter {
+    onCompleted(task: CronTask<any>, result?: unknown): void;
+    onFailed(task: CronTask<any>, error: Error, willRetry: boolean): void;
+}
 
 export class AsyncActions<ID = any> {
     private readonly actions: Actions<ID>;
@@ -17,8 +27,9 @@ export class AsyncActions<ID = any> {
         private taskStore: TaskStore<ID>,
         private taskQueue: TaskQueuesManager<ID>,
         actions: Actions<ID>,
-        task: CronTask<ID>,
-        private generateId: () => ID
+        private task: CronTask<ID>,
+        private generateId: () => ID,
+        private lifecycleEmitter?: AsyncLifecycleEmitter
     ) {
         this.actions = actions;
         this.taskId = tId(task);
@@ -31,24 +42,32 @@ export class AsyncActions<ID = any> {
         // Extract this task's results (NO batch context for async tasks)
         const results = this.actions.extractTaskActions(this.taskId);
 
-        // Fail fast if task didn't call success or fail
+        // If task didn't call success or fail, default to fail (forgetful executor)
         const hasCompletion = results.successTasks.length > 0 || results.failedTasks.length > 0;
         if (!hasCompletion) {
-            throw new Error(`Async task ${this.taskId} completed without calling success() or fail()`);
+            logger.warn(`Async task ${this.taskId} completed without calling success() or fail() — defaulting to fail`);
+            results.failedTasks.push({
+                ...this.task,
+                execution_stats: {
+                    ...(this.task.execution_stats || {}),
+                    last_error: `Async task ${this.taskId} completed without calling success() or fail()`,
+                }
+            });
         }
 
         logger.info(`[AsyncActions] Processing results for async task ${this.taskId}: ` +
             `${results.successTasks.length} success, ${results.failedTasks.length} failed, ` +
             `${results.newTasks.length} new tasks`);
 
-        // Process all results
+        // Process failed tasks with retry logic
         if (results.failedTasks.length > 0) {
-            try {
-                await this.taskStore.markTasksAsFailed(results.failedTasks);
-                logger.info(`[AsyncActions] Marked ${results.failedTasks.length} tasks as failed in database`);
-            } catch (err) {
-                logger.error(`[AsyncActions] Failed to mark tasks as failed:`, err);
-                throw err;
+            for (const failedTask of results.failedTasks) {
+                try {
+                    await this.processFailedTaskWithRetry(failedTask);
+                } catch (err) {
+                    logger.error(`[AsyncActions] Failed to process failed task:`, err);
+                    throw err;
+                }
             }
         }
 
@@ -56,6 +75,17 @@ export class AsyncActions<ID = any> {
             try {
                 await this.taskStore.markTasksAsSuccess(results.successTasks);
                 logger.info(`[AsyncActions] Marked ${results.successTasks.length} tasks as success in database`);
+
+                // Emit lifecycle event for each success
+                if (this.lifecycleEmitter) {
+                    for (const task of results.successTasks) {
+                        try {
+                            this.lifecycleEmitter.onCompleted(task, task.execution_result);
+                        } catch (err) {
+                            logger.error(`[AsyncActions] Lifecycle onCompleted error:`, err);
+                        }
+                    }
+                }
             } catch (err) {
                 logger.error(`[AsyncActions] Failed to mark tasks as success:`, err);
                 throw err;
@@ -65,6 +95,33 @@ export class AsyncActions<ID = any> {
         if (results.newTasks.length > 0) {
             logger.info(`[AsyncActions] Scheduling ${results.newTasks.length} new tasks`);
             await this.scheduleNewTasks(results.newTasks);
+        }
+    }
+
+    /**
+     * Process a failed task through the retry pipeline
+     */
+    private async processFailedTaskWithRetry(failedTask: CronTask<ID>): Promise<void> {
+        const executor = this.taskQueue.getExecutor(failedTask.queue_id, failedTask.type);
+        const maxRetries = failedTask.retries ?? executor?.default_retries ?? 0;
+        const decision = computeRetryDecision(failedTask, maxRetries);
+        const willRetry = decision.action === 'retry' && !!decision.retryTask;
+
+        if (willRetry) {
+            logger.info(`[AsyncActions] Retrying async task ${this.taskId} (attempt ${(decision.retryTask!.execution_stats?.retry_count as number) || 0})`);
+            await this.taskStore.updateTasksForRetry([decision.retryTask!]);
+        } else {
+            logger.info(`[AsyncActions] Async task ${this.taskId} exhausted retries, marking as failed`);
+            await this.taskStore.markTasksAsFailed([failedTask]);
+        }
+
+        if (this.lifecycleEmitter) {
+            const errorMsg = failedTask.execution_stats?.last_error as string || 'Task failed';
+            try {
+                this.lifecycleEmitter.onFailed(failedTask, new Error(errorMsg), willRetry);
+            } catch (err) {
+                logger.error(`[AsyncActions] Lifecycle onFailed error:`, err);
+            }
         }
     }
 

@@ -267,7 +267,15 @@ export class TaskRunner<ID> {
                                 if (!task.id) {
                                     this.logger.error(`[${taskRunnerId}] Cannot hand off task without id (type: ${task.type}). Task will continue but won't be tracked.`);
                                 } else {
-                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId);
+                                    const asyncLifecycleEmitter = this.lifecycleProvider ? {
+                                        onCompleted: (t: CronTask<ID>, result?: unknown) => {
+                                            this.emitTaskCompleted(t, taskRunnerId, result);
+                                        },
+                                        onFailed: (t: CronTask<ID>, error: Error, willRetry: boolean) => {
+                                            this.emitTaskFailed(t, taskRunnerId, error, willRetry);
+                                        }
+                                    } : undefined;
+                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId, asyncLifecycleEmitter);
 
                                     const asyncPromise = taskPromise
                                         .finally(async () => {
