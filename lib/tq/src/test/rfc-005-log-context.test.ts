@@ -1,20 +1,20 @@
-import { describe, expect, it, spyOn } from "bun:test";
-import { TaskRunner } from "../core/TaskRunner.js";
-import { TaskHandler } from "../core/TaskHandler.js";
-import { TaskStore } from "../core/TaskStore.js";
-import { TaskQueuesManager } from "../core/TaskQueuesManager.js";
-import { InMemoryAdapter, CronTask } from "../adapters";
-import { InMemoryQueue, QueueName } from "@supergrowthai/mq";
-import { MemoryCacheProvider } from "memoose-js";
-import { Logger, LogLevel } from "@supergrowthai/utils/server";
-import { runWithLogContext, getLogContext } from "../core/log-context.js";
-import type { ISingleTaskNonParallel, ISingleTaskParallel, IMultiTaskExecutor } from "../core/base/interfaces.js";
-import type { ITaskLifecycleProvider, TaskContext } from "../core/lifecycle.js";
+import {describe, expect, it, spyOn} from "bun:test";
+import {TaskRunner} from "../core/TaskRunner.js";
+import {TaskHandler} from "../core/TaskHandler.js";
+import {TaskStore} from "../core/TaskStore.js";
+import {TaskQueuesManager} from "../core/TaskQueuesManager.js";
+import {CronTask, InMemoryAdapter} from "../adapters";
+import {InMemoryQueue, QueueName} from "@supergrowthai/mq";
+import {MemoryCacheProvider} from "memoose-js";
+import {getLogContext, runWithLogContext} from "../core/log-context.js";
+import type {IMultiTaskExecutor, ISingleTaskNonParallel, ISingleTaskParallel} from "../core/base/interfaces.js";
+import type {ITaskLifecycleProvider} from "../core/lifecycle.js";
 
 declare module "@supergrowthai/mq" {
     interface QueueRegistry {
         "test-log-queue": "test-log-queue";
     }
+
     interface MessagePayloadRegistry {
         "log-task": { data: string };
         "log-task-b": { data: string };
@@ -32,7 +32,7 @@ function makeTask(
         id,
         type,
         queue_id: queueName,
-        payload: { data: "test" },
+        payload: {data: "test"},
         execute_at: new Date(),
         status: "scheduled",
         retries: 0,
@@ -50,11 +50,11 @@ describe("B. ALS — runWithLogContext isolation", () => {
     it("B1: ALS store is set inside callback and cleared after", () => {
         let insideStore: Record<string, string> | undefined;
 
-        runWithLogContext({ user_id: "abc" }, () => {
+        runWithLogContext({user_id: "abc"}, () => {
             insideStore = getLogContext();
         });
 
-        expect(insideStore).toEqual({ user_id: "abc" });
+        expect(insideStore).toEqual({user_id: "abc"});
         expect(getLogContext()).toBeUndefined();
     });
 
@@ -62,24 +62,24 @@ describe("B. ALS — runWithLogContext isolation", () => {
         let innerStore: Record<string, string> | undefined;
         let outerAfterInner: Record<string, string> | undefined;
 
-        runWithLogContext({ a: "1" }, () => {
-            runWithLogContext({ b: "2" }, () => {
+        runWithLogContext({a: "1"}, () => {
+            runWithLogContext({b: "2"}, () => {
                 innerStore = getLogContext();
             });
             outerAfterInner = getLogContext();
         });
 
-        expect(innerStore).toEqual({ b: "2" });
-        expect(outerAfterInner).toEqual({ a: "1" });
+        expect(innerStore).toEqual({b: "2"});
+        expect(outerAfterInner).toEqual({a: "1"});
     });
 
     it("B3: ALS store propagates through async/await", async () => {
-        const result = await runWithLogContext({ user_id: "async" }, async () => {
+        const result = await runWithLogContext({user_id: "async"}, async () => {
             await delay(10);
             return getLogContext();
         });
 
-        expect(result).toEqual({ user_id: "async" });
+        expect(result).toEqual({user_id: "async"});
     });
 });
 
@@ -113,7 +113,7 @@ describe("C. Single-task context propagation", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", campaign_id: "c42" } },
+            metadata: {log_context: {user_id: "alice", campaign_id: "c42"}},
         });
 
         await taskRunner.run("worker-1", [task]);
@@ -153,7 +153,7 @@ describe("C. Single-task context propagation", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", campaign_id: "c42" } },
+            metadata: {log_context: {user_id: "alice", campaign_id: "c42"}},
         });
 
         await taskRunner.run("worker-1", [task]);
@@ -244,10 +244,10 @@ describe("D. Parallel execution — ALS isolation", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const taskA = makeTask("task-alice", "log-task", {
-            metadata: { log_context: { user_id: "alice" } },
+            metadata: {log_context: {user_id: "alice"}},
         });
         const taskB = makeTask("task-bob", "log-task", {
-            metadata: { log_context: { user_id: "bob" } },
+            metadata: {log_context: {user_id: "bob"}},
         });
 
         await taskRunner.run("worker-1", [taskA, taskB]);
@@ -288,10 +288,10 @@ describe("D. Parallel execution — ALS isolation", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const taskA = makeTask("task-a-throw", "log-task", {
-            metadata: { log_context: { user_id: "alice" } },
+            metadata: {log_context: {user_id: "alice"}},
         });
         const taskB = makeTask("task-b-succeed", "log-task", {
-            metadata: { log_context: { user_id: "bob" } },
+            metadata: {log_context: {user_id: "bob"}},
         });
 
         await taskRunner.run("worker-1", [taskA, taskB]);
@@ -330,8 +330,8 @@ describe("E. Multi-task executor", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const tasks = [
-            makeTask("multi-1", "log-task", { metadata: { log_context: { user_id: "alice" } } }),
-            makeTask("multi-2", "log-task", { metadata: { log_context: { user_id: "bob" } } }),
+            makeTask("multi-1", "log-task", {metadata: {log_context: {user_id: "alice"}}}),
+            makeTask("multi-2", "log-task", {metadata: {log_context: {user_id: "bob"}}}),
         ];
 
         await taskRunner.run("worker-1", tasks);
@@ -367,14 +367,14 @@ describe("E. Multi-task executor", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const tasks = [
-            makeTask("multi-e2-1", "log-task", { metadata: { log_context: { user_id: "alice", req_id: "r1" } } }),
-            makeTask("multi-e2-2", "log-task", { metadata: { log_context: { user_id: "bob", req_id: "r2" } } }),
+            makeTask("multi-e2-1", "log-task", {metadata: {log_context: {user_id: "alice", req_id: "r1"}}}),
+            makeTask("multi-e2-2", "log-task", {metadata: {log_context: {user_id: "bob", req_id: "r2"}}}),
         ];
 
         await taskRunner.run("worker-1", tasks);
 
-        expect(taskContextsRead["multi-e2-1"]).toEqual({ user_id: "alice", req_id: "r1" });
-        expect(taskContextsRead["multi-e2-2"]).toEqual({ user_id: "bob", req_id: "r2" });
+        expect(taskContextsRead["multi-e2-1"]).toEqual({user_id: "alice", req_id: "r1"});
+        expect(taskContextsRead["multi-e2-2"]).toEqual({user_id: "bob", req_id: "r2"});
     });
 });
 
@@ -400,7 +400,7 @@ describe("F. Child task inheritance", () => {
                 actions.addTasks([
                     makeTask("", "log-task", {
                         execute_at: new Date(Date.now() + 600_000),
-                        metadata: { log_context: { step: "receipt" } },
+                        metadata: {log_context: {step: "receipt"}},
                     }),
                 ]);
                 actions.success(task);
@@ -409,7 +409,7 @@ describe("F. Child task inheritance", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", req_id: "r1" } },
+            metadata: {log_context: {user_id: "alice", req_id: "r1"}},
         });
 
         const results = await taskRunner.run("worker-1", [task]);
@@ -445,7 +445,7 @@ describe("F. Child task inheritance", () => {
                 actions.addTasks([
                     makeTask("", "log-task", {
                         execute_at: new Date(Date.now() + 600_000),
-                        metadata: { log_context: { step: "child" } },
+                        metadata: {log_context: {step: "child"}},
                     }),
                 ]);
                 actions.success(task);
@@ -454,7 +454,7 @@ describe("F. Child task inheritance", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { env: "prod", step: "parent" } },
+            metadata: {log_context: {env: "prod", step: "parent"}},
         });
 
         const results = await taskRunner.run("worker-1", [task]);
@@ -462,7 +462,7 @@ describe("F. Child task inheritance", () => {
         expect(results.newTasks).toHaveLength(1);
         const child = results.newTasks[0];
         // child's step wins over parent's step; env inherited from parent
-        expect(child.metadata?.log_context).toEqual({ env: "prod", step: "child" });
+        expect(child.metadata?.log_context).toEqual({env: "prod", step: "child"});
     });
 
     it("F3: parent with no log_context — child keeps its own context unchanged", async () => {
@@ -484,7 +484,7 @@ describe("F. Child task inheritance", () => {
                 actions.addTasks([
                     makeTask("", "log-task", {
                         execute_at: new Date(Date.now() + 600_000),
-                        metadata: { log_context: { step: "receipt" } },
+                        metadata: {log_context: {step: "receipt"}},
                     }),
                 ]);
                 actions.success(task);
@@ -500,7 +500,7 @@ describe("F. Child task inheritance", () => {
         expect(results.newTasks).toHaveLength(1);
         const child = results.newTasks[0];
         // Child context unchanged — not undefined, not empty
-        expect(child.metadata?.log_context).toEqual({ step: "receipt" });
+        expect(child.metadata?.log_context).toEqual({step: "receipt"});
     });
 });
 
@@ -542,7 +542,7 @@ describe("G. Retry persistence", () => {
         const task = makeTask(taskId, "log-task", {
             retries: 2,
             retry_after: 100,
-            metadata: { log_context: { user_id: "alice", req_id: "r1" } },
+            metadata: {log_context: {user_id: "alice", req_id: "r1"}},
         });
 
         // Pre-store task in DB (simulates how TaskHandler persists tasks with store_on_failure)
@@ -557,7 +557,7 @@ describe("G. Retry persistence", () => {
                 ...t,
                 status: 'scheduled' as const,
                 execute_at: new Date(),
-                execution_stats: { ...(t.execution_stats || {}), retry_count: 1 },
+                execution_stats: {...(t.execution_stats || {}), retry_count: 1},
             })));
         }
 
@@ -590,7 +590,7 @@ describe("H. Async handoff", () => {
             multiple: false,
             parallel: false,
             store_on_failure: true,
-            asyncConfig: { handoffTimeout: 50 },
+            asyncConfig: {handoffTimeout: 50},
             onTask: async (task, actions) => {
                 await delay(100); // past handoff timeout
                 asyncContext = getLogContext();
@@ -600,10 +600,10 @@ describe("H. Async handoff", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice" } },
+            metadata: {log_context: {user_id: "alice"}},
         });
 
-        const { AsyncTaskManager } = await import("../core/async/AsyncTaskManager.js");
+        const {AsyncTaskManager} = await import("../core/async/AsyncTaskManager.js");
         const asyncManager = new AsyncTaskManager<string>(10);
         const results = await taskRunner.run("worker-1", [task], asyncManager);
 
@@ -622,7 +622,9 @@ describe("I. Lifecycle events", () => {
     it("I1: onTaskCompleted lifecycle event includes log_context", async () => {
         let completedCtx: any;
         const lifecycleProvider: ITaskLifecycleProvider = {
-            onTaskCompleted: (ctx) => { completedCtx = ctx; },
+            onTaskCompleted: (ctx) => {
+                completedCtx = ctx;
+            },
         };
 
         const databaseAdapter = new InMemoryAdapter();
@@ -640,24 +642,28 @@ describe("I. Lifecycle events", () => {
             multiple: false,
             parallel: false,
             store_on_failure: true,
-            onTask: async (task, actions) => { actions.success(task); },
+            onTask: async (task, actions) => {
+                actions.success(task);
+            },
         };
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", campaign_id: "c42" } },
+            metadata: {log_context: {user_id: "alice", campaign_id: "c42"}},
         });
 
         await taskRunner.run("worker-1", [task]);
 
         expect(completedCtx).toBeDefined();
-        expect(completedCtx.log_context).toEqual({ user_id: "alice", campaign_id: "c42" });
+        expect(completedCtx.log_context).toEqual({user_id: "alice", campaign_id: "c42"});
     });
 
     it("I2: onTaskFailed lifecycle event includes log_context", async () => {
         let failedCtx: any;
         const lifecycleProvider: ITaskLifecycleProvider = {
-            onTaskFailed: (ctx) => { failedCtx = ctx; },
+            onTaskFailed: (ctx) => {
+                failedCtx = ctx;
+            },
         };
 
         const databaseAdapter = new InMemoryAdapter();
@@ -682,19 +688,21 @@ describe("I. Lifecycle events", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", campaign_id: "c42" } },
+            metadata: {log_context: {user_id: "alice", campaign_id: "c42"}},
         });
 
         await taskRunner.run("worker-1", [task]);
 
         expect(failedCtx).toBeDefined();
-        expect(failedCtx.log_context).toEqual({ user_id: "alice", campaign_id: "c42" });
+        expect(failedCtx.log_context).toEqual({user_id: "alice", campaign_id: "c42"});
     });
 
     it("I3: onTaskScheduled lifecycle event includes log_context", async () => {
         let scheduledCtx: any;
         const lifecycleProvider: ITaskLifecycleProvider = {
-            onTaskScheduled: (ctx) => { scheduledCtx = ctx; },
+            onTaskScheduled: (ctx) => {
+                scheduledCtx = ctx;
+            },
         };
 
         const databaseAdapter = new InMemoryAdapter();
@@ -704,26 +712,28 @@ describe("I. Lifecycle events", () => {
         const taskHandler = new TaskHandler<string>(
             messageQueue, taskQueue, databaseAdapter, cacheProvider,
             undefined, undefined,
-            { lifecycleProvider }
+            {lifecycleProvider}
         );
 
         const executor: ISingleTaskNonParallel<string, "log-task"> = {
             multiple: false,
             parallel: false,
             store_on_failure: true,
-            onTask: async (task, actions) => { actions.success(task); },
+            onTask: async (task, actions) => {
+                actions.success(task);
+            },
         };
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
             execute_at: new Date(Date.now() + 600_000), // future — goes to DB
-            metadata: { log_context: { user_id: "alice", campaign_id: "c42" } },
+            metadata: {log_context: {user_id: "alice", campaign_id: "c42"}},
         });
 
         await taskHandler.addTasks([task]);
 
         expect(scheduledCtx).toBeDefined();
-        expect(scheduledCtx.log_context).toEqual({ user_id: "alice", campaign_id: "c42" });
+        expect(scheduledCtx.log_context).toEqual({user_id: "alice", campaign_id: "c42"});
     });
 });
 
@@ -750,7 +760,7 @@ describe("J. Size validation", () => {
         );
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: bigContext },
+            metadata: {log_context: bigContext},
             execute_at: new Date(Date.now() + 600_000), // future — goes to DB
         });
 
@@ -786,7 +796,7 @@ describe("J. Size validation", () => {
         );
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: largeContext },
+            metadata: {log_context: largeContext},
             execute_at: new Date(Date.now() + 600_000),
         });
 
@@ -820,7 +830,7 @@ describe("J. Size validation", () => {
         };
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: validContext },
+            metadata: {log_context: validContext},
             execute_at: new Date(Date.now() + 600_000),
         });
 
@@ -860,7 +870,7 @@ describe("K. Runtime key collision", () => {
 
         const taskId = databaseAdapter.generateId();
         const task = makeTask(taskId, "log-task", {
-            metadata: { log_context: { task_id: "spoofed", worker_id: "fake" } },
+            metadata: {log_context: {task_id: "spoofed", worker_id: "fake"}},
         });
 
         await taskRunner.run("real-worker", [task]);
@@ -901,7 +911,7 @@ describe("L. actions.log", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", campaign_id: "c42" } },
+            metadata: {log_context: {user_id: "alice", campaign_id: "c42"}},
         });
 
         await taskRunner.run("worker-1", [task]);
@@ -943,8 +953,8 @@ describe("L. actions.log", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const tasks = [
-            makeTask("multi-1", "log-task", { metadata: { log_context: { user_id: "alice" } } }),
-            makeTask("multi-2", "log-task", { metadata: { log_context: { user_id: "bob" } } }),
+            makeTask("multi-1", "log-task", {metadata: {log_context: {user_id: "alice"}}}),
+            makeTask("multi-2", "log-task", {metadata: {log_context: {user_id: "bob"}}}),
         ];
 
         await taskRunner.run("worker-1", tasks);
@@ -988,7 +998,7 @@ describe("M. Value sanitization", () => {
         taskQueue.register(queueName, "log-task", executor);
 
         const task = makeTask(databaseAdapter.generateId(), "log-task", {
-            metadata: { log_context: { user_id: "alice", note: "test]value\ninjected" } },
+            metadata: {log_context: {user_id: "alice", note: "test]value\ninjected"}},
         });
 
         await taskRunner.run("worker-1", [task]);
