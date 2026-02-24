@@ -258,26 +258,6 @@ export class PrismaAdapter<
         }
     }
 
-    async markTasksAsFailed(tasks: CronTask<TId>[]): Promise<void> {
-        const taskIds = tasks.map(t => t.id).filter(Boolean);
-        if (!taskIds.length) return;
-
-        await this.delegate.updateMany({
-            where: {id: {in: taskIds}},
-            data: {status: 'failed', updated_at: new Date()}
-        });
-    }
-
-    async markTasksAsIgnored(tasks: CronTask<TId>[]): Promise<void> {
-        const taskIds = tasks.map(t => t.id).filter(Boolean);
-        if (!taskIds.length) return;
-
-        await this.delegate.updateMany({
-            where: {id: {in: taskIds}},
-            data: {status: 'ignored', updated_at: new Date()}
-        });
-    }
-
     async getTasksByIds(taskIds: TId[]): Promise<CronTask<TId>[]> {
         if (!taskIds.length) return [];
 

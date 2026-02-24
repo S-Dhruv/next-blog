@@ -92,7 +92,8 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
             retry_after: task.retry_after,
             execution_stats: task.execution_stats,
             force_store: task.force_store,
-            metadata: task.metadata
+            metadata: task.metadata,
+            partition_key: task.partition_key
         }));
 
         try {
@@ -213,22 +214,6 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
         }
     }
 
-    async markTasksAsFailed(tasks: CronTask<ObjectId>[]): Promise<void> {
-        const collection = await this.collection;
-        const taskIds = tasks.map(t => t.id).filter(Boolean) as ObjectId[];
-
-
-        await collection.updateMany(
-            {_id: {$in: taskIds}},
-            {
-                $set: {
-                    status: 'failed',
-                    updated_at: new Date()
-                }
-            }
-        );
-    }
-
     async getTasksByIds(taskIds: ObjectId[]): Promise<CronTask<ObjectId>[]> {
         const collection = await this.collection;
 
@@ -333,20 +318,4 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
     async initialize() {
     }
 
-    async markTasksAsIgnored(tasks: CronTask<ObjectId>[]): Promise<void> {
-        const collection = await this.collection;
-        const taskIds = tasks.map(t => t.id).filter(Boolean) as ObjectId[];
-
-
-        await collection.updateMany(
-            {_id: {$in: taskIds}},
-            {
-                $set: {
-                    status: 'ignored',
-                    //update execution_stats
-                    updated_at: new Date()
-                },
-            }
-        );
-    }
 }

@@ -40,13 +40,6 @@ export interface ITaskStorageAdapter<ID = any> {
     markTasksAsExecuted(tasks: CronTask<ID>[]): Promise<void>;
 
     /**
-     * Update task status to failed
-     */
-    markTasksAsFailed(tasks: CronTask<ID>[]): Promise<void>;
-
-    markTasksAsIgnored(tasks: CronTask<ID>[]): Promise<void>;
-
-    /**
      * Get tasks by IDs
      */
     getTasksByIds(taskIds: ID[]): Promise<CronTask<ID>[]>;
