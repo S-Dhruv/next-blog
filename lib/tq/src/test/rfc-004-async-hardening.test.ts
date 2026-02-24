@@ -363,6 +363,29 @@ describe("RFC-004: Async Hardening", () => {
             await mgr.shutdown();
         });
 
+        it("A5b: async onTaskTimeout rejection — sweep continues, no unhandled rejection", async () => {
+            let callCount = 0;
+            const mgr = makeManager({
+                sweepIntervalMs: 30,
+                defaultMaxDurationMs: 50,
+                onTaskTimeout: async () => {
+                    callCount++;
+                    if (callCount === 1) throw new Error("async callback boom");
+                }
+            });
+
+            mgr.handoffTask(makeTask({id: "a5b-async-throw"}), neverResolve());
+            mgr.handoffTask(makeTask({id: "a5b-ok"}), neverResolve());
+
+            await delay(200);
+
+            // Both evicted even though first async callback rejected
+            expect(mgr.getMetrics().activeTaskCount).toBe(0);
+            expect(mgr.getMetrics().totalTimedOut).toBe(2);
+
+            await mgr.shutdown();
+        });
+
         it("A6: late-resolving promise after sweep — no crash", async () => {
             let resolveHung: (() => void) | undefined;
             const hungPromise = new Promise<void>(r => { resolveHung = r; });
@@ -628,6 +651,41 @@ describe("RFC-004: Async Hardening", () => {
             // Should be retried, not failed
             const stored = await databaseAdapter.getTasksByIds(["b3-forget-retry"]);
             expect(stored).toHaveLength(1);
+            expect(stored[0].status).toBe("scheduled");
+            expect(stored[0].execution_stats?.retry_count).toBe(1);
+        });
+
+        it("B3b: task.retries undefined — falls back to executor.default_retries", async () => {
+            const databaseAdapter = new InMemoryAdapter();
+            const messageQueue = new InMemoryQueue();
+            const taskQueue = new TaskQueuesManager<string>(messageQueue);
+            const taskStore = new TaskStore<string>(databaseAdapter);
+
+            const executor: ISingleTaskNonParallel<string, "rfc004-task"> = {
+                multiple: false,
+                parallel: false,
+                store_on_failure: true,
+                default_retries: 3,
+            } as any;
+            taskQueue.register(QUEUE, "rfc004-task", executor);
+
+            // task.retries is undefined — retry logic must fall back to executor.default_retries (3)
+            const task = makeTask({id: "b3b-fallback", retries: undefined as any, execution_stats: {retry_count: 0}});
+            await databaseAdapter.addTasksToScheduled([task]);
+
+            const actions = new Actions<string>("test-b3b");
+            const forked = actions.forkForTask(task);
+            forked.fail(task, new Error("should retry via executor config"));
+
+            const asyncActions = new AsyncActions<string>(
+                messageQueue, taskStore, taskQueue, actions, task, () => databaseAdapter.generateId()
+            );
+
+            await asyncActions.onPromiseFulfilled();
+
+            const stored = await databaseAdapter.getTasksByIds(["b3b-fallback"]);
+            expect(stored).toHaveLength(1);
+            // Must be scheduled (retried), NOT failed — proves executor.default_retries was used
             expect(stored[0].status).toBe("scheduled");
             expect(stored[0].execution_stats?.retry_count).toBe(1);
         });
@@ -941,6 +999,7 @@ describe("RFC-004: Async Hardening", () => {
 
             const stored = await databaseAdapter.getTasksByIds(["g2-parent"]);
             expect(stored[0].status).toBe("executed");
+            expect(childReceived).toBe(true);
 
             await asyncTaskManager.shutdown();
             await messageQueue.shutdown();
@@ -1162,8 +1221,9 @@ describe("RFC-004: Async Hardening", () => {
             await delay(30);
 
             // Should have 1 timeout, and the late resolve's .then handler will fire
-            // but the task is already removed from the map
+            // but the task is already removed from the map — so totalCompleted must NOT increment
             expect(mgr.getMetrics().totalTimedOut).toBe(1);
+            expect(mgr.getMetrics().totalCompleted).toBe(0);
 
             await mgr.shutdown();
         });
