@@ -75,8 +75,13 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
     private readonly taskRunnerId: string;
     private readonly taskContexts = new Map<string, TaskContext<ID>>();
 
+    /** Logger for multi-task executors — carries runtime-only context (RFC-005) */
+    readonly log: Logger;
+
     constructor(taskRunnerId: string) {
         this.taskRunnerId = taskRunnerId;
+        // Root actions logger has no task-specific context — only ALS runtime context applies
+        this.log = logger.child({});
     }
 
     /**
@@ -84,13 +89,19 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
      */
     forkForTask(task: CronTask<ID>): ExecutorActions<ID> {
         const taskId = tId(task);
+        const parentLogContext = task.metadata?.log_context;
 
         // Initialize context for this task
         const context: TaskContext<ID> = {task, actions: []};
         this.taskContexts.set(taskId, context);
 
+        // Create child logger scoped to this task's log_context (RFC-005)
+        const taskLog = logger.child(parentLogContext || {});
+
         // Return a scoped actions object that tracks everything in this context
         return {
+            log: taskLog,
+
             fail: (t: CronTask<ID>, error?: Error | string, meta?: Record<string, unknown>) => {
                 context.actions.push({
                     type: 'fail',
@@ -113,10 +124,21 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
             },
 
             addTasks: (tasks: CronTask<ID>[]) => {
+                // Merge parent log_context onto child tasks (RFC-005: parent keys as defaults, child wins)
+                const mergedTasks = parentLogContext
+                    ? tasks.map(t => ({
+                        ...t,
+                        metadata: {
+                            ...(t.metadata || {}),
+                            log_context: {...parentLogContext, ...(t.metadata?.log_context || {})}
+                        }
+                    }))
+                    : tasks;
+
                 context.actions.push({
                     type: 'addTasks',
                     timestamp: Date.now(),
-                    newTasks: tasks
+                    newTasks: mergedTasks
                 });
                 logger.info(`[${this.taskRunnerId}] Task ${taskId} adding ${tasks.length} new tasks`);
             }

@@ -5,6 +5,7 @@ import {getEnabledQueues} from "./environment.js";
 import moment from "moment";
 import type {MessageConsumer} from "@supergrowthai/mq";
 import {IMessageQueue, QueueName} from "@supergrowthai/mq";
+import type {MessageMetadata} from "@supergrowthai/mq";
 import {ProcessedTaskResult} from "./task-processor-types.js";
 import {CronTask, ITaskStorageAdapter} from "../adapters";
 import type {CacheProvider} from "memoose-js";
@@ -103,7 +104,44 @@ export class TaskHandler<ID> {
         return this.config.workerProvider;
     }
 
+    /**
+     * Validate and sanitize log_context on a task (RFC-005).
+     * - >10 keys: truncate to first 10 alphabetically, warn
+     * - >1024 bytes total: drop entire context, warn
+     */
+    private validateLogContext(task: CronTask<ID>): CronTask<ID> {
+        const logCtx = task.metadata?.log_context;
+        if (!logCtx) return task;
+
+        let validatedCtx = logCtx;
+        const keys = Object.keys(logCtx).sort();
+
+        // Truncate to 10 keys
+        if (keys.length > 10) {
+            this.logger.warn(`[TQ] log_context has ${keys.length} keys (max 10), truncating for task type ${task.type}`);
+            const truncated: Record<string, string> = {};
+            for (let i = 0; i < 10; i++) truncated[keys[i]] = logCtx[keys[i]];
+            validatedCtx = truncated;
+        }
+
+        // Check total size (1KB limit)
+        const serialized = JSON.stringify(validatedCtx);
+        if (serialized.length > 1024) {
+            this.logger.warn(`[TQ] log_context exceeds 1KB (${serialized.length} chars), dropping for task type ${task.type}`);
+            const {log_context: _, ...restMeta} = task.metadata!;
+            return {...task, metadata: Object.keys(restMeta).length > 0 ? (restMeta as MessageMetadata) : undefined} as CronTask<ID>;
+        }
+
+        if (validatedCtx !== logCtx) {
+            return {...task, metadata: {...task.metadata, log_context: validatedCtx}};
+        }
+        return task;
+    }
+
     async addTasks(tasks: CronTask<ID>[]) {
+        // Validate log_context on all tasks (RFC-005)
+        tasks = tasks.map(t => this.validateLogContext(t));
+
         const diffedItems = tasks.reduce(
             (acc, {force_store, ...task}) => {
                 const currentTime = new Date();
@@ -665,7 +703,8 @@ export class TaskHandler<ID> {
             payload: this.config.lifecycle?.include_payload ? payload : {},
             attempt: retryCount + 1,
             max_retries: maxRetries,
-            scheduled_at: task.created_at || new Date()
+            scheduled_at: task.created_at || new Date(),
+            log_context: task.metadata?.log_context,
         };
     }
 

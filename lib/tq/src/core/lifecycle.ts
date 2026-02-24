@@ -24,6 +24,8 @@ export interface TaskContext {
     scheduled_at: Date;
     /** Worker processing this task */
     worker_id?: string;
+    /** User-provided log correlation context (RFC-005) */
+    log_context?: Record<string, string>;
 }
 
 export interface TaskTiming {

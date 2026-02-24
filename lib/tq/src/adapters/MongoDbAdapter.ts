@@ -91,7 +91,8 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
             task_hash: task.task_hash,
             retry_after: task.retry_after,
             execution_stats: task.execution_stats,
-            force_store: task.force_store
+            force_store: task.force_store,
+            metadata: task.metadata
         }));
 
         try {

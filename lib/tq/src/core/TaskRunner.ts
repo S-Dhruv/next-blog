@@ -13,6 +13,8 @@ import {TaskQueuesManager} from "./TaskQueuesManager";
 import {TaskStore} from "./TaskStore";
 import {IAsyncTaskManager} from "./async/async-task-manager";
 import type {ITaskLifecycleProvider, TaskContext, TaskHandlerLifecycleConfig, TaskTiming} from "./lifecycle.js";
+import {runWithLogContext} from "./log-context.js";
+import type {LogStore} from "./log-context.js";
 
 export interface AsyncTask<ID> {
     task: CronTask<ID>;
@@ -40,6 +42,32 @@ export class TaskRunner<ID> {
             prefix: "task_lock_",
             defaultTimeout: 30 * 60
         });
+    }
+
+    // ============ Log Context Helpers (RFC-005) ============
+
+    /**
+     * Build ALS log store for a single task execution.
+     * Runtime keys (task_id, task_type, worker_id) override user-supplied log_context.
+     */
+    private buildLogStore(task: CronTask<ID>, workerId: string): LogStore {
+        return {
+            ...(task.metadata?.log_context || {}),
+            task_id: task.id?.toString() || tId(task),
+            task_type: task.type,
+            worker_id: workerId,
+        };
+    }
+
+    /**
+     * Build ALS log store for a multi-task (batch) execution.
+     * Only runtime keys — no user log_context (ambiguous across tasks).
+     */
+    private buildBatchLogStore(tasks: CronTask<ID>[], workerId: string): LogStore {
+        return {
+            worker_id: workerId,
+            batch_size: String(tasks.length),
+        };
     }
 
     // ============ Lifecycle Helpers ============
@@ -137,14 +165,17 @@ export class TaskRunner<ID> {
             this.logger.info(`[${taskRunnerId}] Processing ${taskGroup.tasks.length} tasks of type: ${taskGroup.type}`);
 
             if (executor.multiple) {
-                await executor.onTasks(taskGroup.tasks as any[], actions).catch(err => {
-                    this.logger.error(`[${taskRunnerId}] executor.onTasks failed: ${err}`);
-                    for (const task of taskGroup.tasks) {
-                        if (actions.getTaskResultStatus(tId(task)) === 'pending') {
-                            actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                const batchStore = this.buildBatchLogStore(taskGroup.tasks, taskRunnerId);
+                await runWithLogContext(batchStore, () =>
+                    executor.onTasks(taskGroup.tasks as any[], actions).catch(err => {
+                        this.logger.error(`[${taskRunnerId}] executor.onTasks failed: ${err}`);
+                        for (const task of taskGroup.tasks) {
+                            if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                            }
                         }
-                    }
-                });
+                    })
+                );
             } else {
                 if (executor.parallel) {
                     const chunks = chunk(taskGroup.tasks, executor.chunkSize) as CronTask<ID>[][];
@@ -159,12 +190,15 @@ export class TaskRunner<ID> {
                         for (let j = 0; j < taskChunk.length; j++) {
                             const task = taskChunk[j];
                             const taskActions = actions.forkForTask(task);
-                            chunkPromises.push(executor.onTask(task, taskActions).catch(err => {
-                                this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
-                                if (actions.getTaskResultStatus(tId(task)) === 'pending') {
-                                    actions.fail(task, err instanceof Error ? err : new Error(String(err)));
-                                }
-                            }));
+                            const logStore = this.buildLogStore(task, taskRunnerId);
+                            chunkPromises.push(runWithLogContext(logStore, () =>
+                                executor.onTask(task, taskActions).catch(err => {
+                                    this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
+                                    if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                        actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                                    }
+                                })
+                            ));
                         }
                         await Promise.all(chunkPromises);
 
@@ -192,12 +226,15 @@ export class TaskRunner<ID> {
                             this.emitTaskStarted(task, taskRunnerId);
 
                             const taskActions = actions.forkForTask(task);
-                            await executor.onTask(task, taskActions).catch(err => {
-                                this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
-                                if (actions.getTaskResultStatus(tId(task)) === 'pending') {
-                                    actions.fail(task, err instanceof Error ? err : new Error(String(err)));
-                                }
-                            });
+                            const logStore = this.buildLogStore(task, taskRunnerId);
+                            await runWithLogContext(logStore, () =>
+                                executor.onTask(task, taskActions).catch(err => {
+                                    this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
+                                    if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                        actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                                    }
+                                })
+                            );
 
                             // Emit completion event based on result
                             const resultStatus = actions.getTaskResultStatus(tId(task));
@@ -217,13 +254,16 @@ export class TaskRunner<ID> {
                             let isTimedOut = false;
 
                             const taskActions = actions.forkForTask(task);
+                            const logStore = this.buildLogStore(task, taskRunnerId);
 
-                            const taskPromise = executor.onTask(task, taskActions).catch(err => {
-                                this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
-                                if (actions.getTaskResultStatus(tId(task)) === 'pending') {
-                                    actions.fail(task, err instanceof Error ? err : new Error(String(err)));
-                                }
-                            });
+                            const taskPromise = runWithLogContext(logStore, () =>
+                                executor.onTask(task, taskActions).catch(err => {
+                                    this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
+                                    if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                        actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                                    }
+                                })
+                            );
 
                             let timeoutId: NodeJS.Timeout | undefined;
                             const timeoutPromise = new Promise<'~~~timeout'>(resolve => {
@@ -344,7 +384,8 @@ export class TaskRunner<ID> {
             attempt: retryCount + 1,
             max_retries: maxRetries,
             scheduled_at: task.created_at || new Date(),
-            worker_id: workerId
+            worker_id: workerId,
+            log_context: task.metadata?.log_context,
         };
     }
 

@@ -1,5 +1,6 @@
 import {CronTask} from "../../adapters";
 import {MessageType, TypedMessage} from "@supergrowthai/mq";
+import {Logger} from "@supergrowthai/utils";
 
 /**
  * Type helper to extract the correct CronTask type based on message type
@@ -22,6 +23,8 @@ export type ExecutorActions<ID = any> = {
     addTasks(task: CronTask<ID>[]): void;
     fail(task: CronTask<ID>, error?: Error | string, meta?: Record<string, unknown>): void;
     success(task: CronTask<ID>, result?: unknown): void;
+    /** Child logger scoped to this task's log_context (RFC-005) */
+    readonly log: Logger;
 }
 
 export interface IMultiTaskExecutor<ID = any, T extends MessageType = MessageType> extends IBaseExecutor {
