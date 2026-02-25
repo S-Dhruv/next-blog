@@ -2,6 +2,10 @@ import {ExecutorActions} from "./base/interfaces";
 import {Logger, LogLevel} from "@supergrowthai/utils";
 import {tId} from "../utils/task-id-gen.js";
 import {CronTask} from "../adapters";
+import type {StartFlowInput, FlowMeta} from "./flow/types.js";
+import type {EntityTaskProjection} from "./entity/IEntityProjectionProvider.js";
+import type {QueueName} from "@supergrowthai/mq";
+import {randomUUID} from "crypto";
 
 const logger = new Logger('Actions', LogLevel.INFO);
 
@@ -25,6 +29,8 @@ export interface ActionResults<ID = any> {
     successTasks: CronTask<ID>[];
     newTasks: CronTask<ID>[];
     ignoredTasks: CronTask<ID>[];
+    /** RFC-002: Entity projections from startFlow calls (processing status, task_id = flow_id) */
+    flowProjections: EntityTaskProjection[];
 }
 
 const MAX_RESULT_SIZE_BYTES = 256 * 1024; // 256KB
@@ -75,6 +81,8 @@ function enrichTaskWithError<ID>(task: CronTask<ID>, error?: Error | string, met
 export class Actions<ID = any> implements ExecutorActions<ID> {
     private readonly taskRunnerId: string;
     private readonly taskContexts = new Map<string, TaskContext<ID>>();
+    /** RFC-002: Flow projections accumulated from startFlow calls */
+    private readonly _flowProjections: EntityTaskProjection[] = [];
 
     /** Logger for multi-task executors — carries runtime-only context (RFC-005) */
     readonly log: Logger;
@@ -142,6 +150,10 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
                     newTasks: mergedTasks
                 });
                 logger.info(`[${this.taskRunnerId}] Task ${taskId} adding ${tasks.length} new tasks`);
+            },
+
+            startFlow: (input: StartFlowInput): string => {
+                return this._startFlowImpl(input, parentLogContext);
             }
         };
     }
@@ -209,6 +221,110 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
     }
 
     /**
+     * RFC-002: Start a fan-out/fan-in flow from the root Actions context (multi-task executors).
+     */
+    startFlow(input: StartFlowInput): string {
+        return this._startFlowImpl(input);
+    }
+
+    /**
+     * RFC-002: Internal implementation for startFlow.
+     * Used by both root Actions and forked per-task actions.
+     */
+    private _startFlowImpl(input: StartFlowInput, parentLogContext?: Record<string, string>): string {
+        const {steps, config} = input;
+
+        if (steps.length === 0) {
+            throw new Error('[TQ/RFC-002] startFlow requires at least 1 step');
+        }
+
+        const flowId = randomUUID();
+        const now = new Date();
+        const failurePolicy = config.failure_policy || 'continue';
+
+        const stepTasks: CronTask<ID>[] = steps.map((step, index) => {
+            const flowMeta: FlowMeta = {
+                flow_id: flowId,
+                step_index: index,
+                total_steps: steps.length,
+                join: config.join,
+                failure_policy: failurePolicy,
+                ...(config.entity ? {entity: config.entity} : {}),
+            };
+
+            const metadata: Record<string, unknown> = {
+                flow_meta: flowMeta as unknown as Record<string, unknown>,
+            };
+
+            // Inherit parent log_context onto step tasks (RFC-005)
+            if (parentLogContext) {
+                (metadata as any).log_context = {...parentLogContext};
+            }
+
+            return {
+                type: step.type,
+                queue_id: step.queue_id as QueueName,
+                payload: step.payload,
+                execute_at: now,
+                status: 'scheduled' as const,
+                created_at: now,
+                updated_at: now,
+                force_store: true,
+                metadata,
+                ...(step.entity ? {entity: step.entity} : {}),
+            } as CronTask<ID>;
+        });
+
+        // Create timeout sentinel if configured
+        if (config.timeout_ms && config.timeout_ms > 0) {
+            const timeoutFlowMeta: FlowMeta = {
+                flow_id: flowId,
+                step_index: -1,
+                total_steps: steps.length,
+                join: config.join,
+                failure_policy: failurePolicy,
+                is_timeout: true,
+                ...(config.entity ? {entity: config.entity} : {}),
+            };
+
+            stepTasks.push({
+                type: '_flow.timeout',
+                queue_id: config.join.queue_id as QueueName,
+                payload: {flow_id: flowId, is_timeout: true},
+                execute_at: new Date(now.getTime() + config.timeout_ms),
+                status: 'scheduled' as const,
+                created_at: now,
+                updated_at: now,
+                force_store: true,
+                metadata: {
+                    flow_meta: timeoutFlowMeta as unknown as Record<string, unknown>,
+                    ...(parentLogContext ? {log_context: {...parentLogContext}} : {}),
+                },
+            } as unknown as CronTask<ID>);
+        }
+
+        // Add step tasks via the existing addTasks mechanism
+        this.addTasks(stepTasks);
+
+        // RFC-002 + RFC-003: If entity present, emit a 'processing' projection with flow_id as task_id
+        if (config.entity) {
+            this._flowProjections.push({
+                task_id: flowId,
+                entity_id: config.entity.id,
+                entity_type: config.entity.type,
+                task_type: config.join.type,
+                queue_id: config.join.queue_id,
+                status: 'processing',
+                created_at: now,
+                updated_at: now,
+            });
+        }
+
+        logger.info(`[${this.taskRunnerId}] Started flow ${flowId} with ${steps.length} steps, join: ${config.join.type}`);
+        return flowId;
+    }
+
+    /**
      * Check the result status for a specific task
      * Returns 'success', 'fail', or 'pending' (no action recorded yet)
      */
@@ -231,7 +347,8 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
             failedTasks: [],
             successTasks: [],
             newTasks: [],
-            ignoredTasks: []
+            ignoredTasks: [],
+            flowProjections: []
         };
 
         const context = this.taskContexts.get(taskId);
@@ -277,7 +394,8 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
             failedTasks: [],
             successTasks: [],
             newTasks: [],
-            ignoredTasks: []
+            ignoredTasks: [],
+            flowProjections: [...this._flowProjections]
         };
 
         const excludeSet = new Set(excludeTaskIds);
@@ -321,6 +439,9 @@ export class Actions<ID = any> implements ExecutorActions<ID> {
                 this.taskContexts.delete(taskId);
             }
         }
+
+        // Clear flow projections after extraction
+        this._flowProjections.length = 0;
 
         return results;
     }

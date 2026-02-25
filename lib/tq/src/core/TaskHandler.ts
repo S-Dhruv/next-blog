@@ -94,7 +94,8 @@ export class TaskHandler<ID> {
             this.config.lifecycleProvider,
             this.config.lifecycle,
             this.config.entityProjection,
-            this.config.entityProjectionConfig
+            this.config.entityProjectionConfig,
+            this.config.flowMiddleware
         );
     }
 
@@ -390,10 +391,6 @@ export class TaskHandler<ID> {
             await this.taskStore.updateTasksForRetry(tasksToRetry);
         }
 
-        if (newTasks.length > 0) {
-            await this.addTasks(newTasks);
-        }
-
         if (finalFailedTasks.length > 0) {
             await this.taskStore.markTasksAsFailed(finalFailedTasks);
         }
@@ -444,6 +441,30 @@ export class TaskHandler<ID> {
                 this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
             }
         }
+
+        // RFC-002: Flow middleware — process completed tasks for barrier tracking and join dispatch
+        if (this.config.flowMiddleware) {
+            try {
+                const flowResult = await this.config.flowMiddleware.onPostProcess({successTasks, failedTasks: finalFailedTasks});
+
+                // Sync flow entity projections
+                if (flowResult.projections.length > 0 && this.entityProjectionProvider) {
+                    await syncProjections(flowResult.projections, this.entityProjectionProvider, this.logger);
+                }
+
+                // Dispatch join tasks
+                if (flowResult.joinTasks.length > 0) {
+                    await this.addTasks(flowResult.joinTasks);
+                }
+            } catch (err) {
+                this.logger.error(`[TQ] Flow middleware failed (non-fatal): ${err}`);
+            }
+        }
+
+        // Dispatch new tasks (executor-spawned child tasks)
+        if (newTasks.length > 0) {
+            await this.addTasks(newTasks);
+        }
     }
 
     startConsumingTasks(streamName: QueueName, abortSignal?: AbortSignal) {
@@ -474,7 +495,8 @@ export class TaskHandler<ID> {
                 newTasks,
                 successTasks,
                 asyncTasks,
-                ignoredTasks
+                ignoredTasks,
+                flowProjections
             } = await this.taskRunner.run(id, tasks, this.asyncTaskManager, abortSignal)
                 .catch(err => {
                     this.logger.error("Failed to execute tasks, returning all as failed for retry:", err);
@@ -483,7 +505,8 @@ export class TaskHandler<ID> {
                         newTasks: [] as CronTask<ID>[],
                         successTasks: [] as CronTask<ID>[],
                         asyncTasks: [] as AsyncTask<ID>[],
-                        ignoredTasks: [] as CronTask<ID>[]
+                        ignoredTasks: [] as CronTask<ID>[],
+                        flowProjections: [] as EntityTaskProjection[]
                     }
                 });
 
@@ -516,6 +539,11 @@ export class TaskHandler<ID> {
                     .catch(err => {
                         this.logger.error("Failed to mark tasks as ignored", err)
                     });
+            }
+
+            // RFC-002: Sync flow projections from startFlow calls (processing status, task_id = flow_id)
+            if (this.entityProjectionProvider && flowProjections?.length > 0) {
+                await syncProjections(flowProjections, this.entityProjectionProvider, this.logger);
             }
 
             await this.postProcessTasks({failedTasks, newTasks, successTasks})

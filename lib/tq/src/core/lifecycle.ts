@@ -160,4 +160,6 @@ export interface TaskHandlerConfig {
     entityProjection?: IEntityProjectionProvider;
     /** RFC-003: Entity projection configuration */
     entityProjectionConfig?: EntityProjectionConfig;
+    /** RFC-002: Flow middleware for fan-out/fan-in orchestration */
+    flowMiddleware?: import("./flow/FlowMiddleware.js").FlowMiddleware<any>;
 }

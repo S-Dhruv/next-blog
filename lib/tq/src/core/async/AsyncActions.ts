@@ -8,6 +8,7 @@ import {TaskQueuesManager} from "../TaskQueuesManager.js";
 import {computeRetryDecision} from "./retry-utils.js";
 import type {IEntityProjectionProvider, EntityProjectionConfig, EntityTaskProjection} from "../entity/IEntityProjectionProvider.js";
 import {buildProjection, syncProjections} from "../entity/IEntityProjectionProvider.js";
+import type {FlowMiddleware} from "../flow/FlowMiddleware.js";
 
 const logger = new Logger('AsyncActions', LogLevel.INFO);
 
@@ -33,7 +34,8 @@ export class AsyncActions<ID = any> {
         private generateId: () => ID,
         private lifecycleEmitter?: AsyncLifecycleEmitter,
         private entityProjection?: IEntityProjectionProvider<ID>,
-        private entityProjectionConfig?: EntityProjectionConfig
+        private entityProjectionConfig?: EntityProjectionConfig,
+        private flowMiddleware?: FlowMiddleware<ID>
     ) {
         this.actions = actions;
         this.taskId = tId(task);
@@ -105,6 +107,40 @@ export class AsyncActions<ID = any> {
             } catch (err) {
                 logger.error(`[AsyncActions] Failed to mark tasks as success:`, err);
                 throw err;
+            }
+        }
+
+        // RFC-002: Flow middleware — process terminal tasks for barrier tracking and join dispatch
+        if (this.flowMiddleware) {
+            try {
+                // Collect final failures (not retries) for flow middleware
+                const finalFailedTasks: CronTask<ID>[] = [];
+                for (const failedTask of results.failedTasks) {
+                    const executor = this.taskQueue.getExecutor(failedTask.queue_id, failedTask.type);
+                    const maxRetries = failedTask.retries ?? executor?.default_retries ?? 0;
+                    const decision = computeRetryDecision(failedTask, maxRetries);
+                    // Only include final failures (no more retries)
+                    if (decision.action !== 'retry' || !decision.retryTask) {
+                        finalFailedTasks.push(failedTask);
+                    }
+                }
+
+                if (results.successTasks.length > 0 || finalFailedTasks.length > 0) {
+                    const flowResult = await this.flowMiddleware.onPostProcess({
+                        successTasks: results.successTasks,
+                        failedTasks: finalFailedTasks,
+                    });
+
+                    if (flowResult.projections.length > 0 && this.entityProjection) {
+                        await syncProjections(flowResult.projections, this.entityProjection, logger);
+                    }
+
+                    if (flowResult.joinTasks.length > 0) {
+                        await this.scheduleNewTasks(flowResult.joinTasks);
+                    }
+                }
+            } catch (err) {
+                logger.error(`[AsyncActions] Flow middleware failed (non-fatal): ${err}`);
             }
         }
 

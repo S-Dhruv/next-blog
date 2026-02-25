@@ -17,6 +17,7 @@ import {runWithLogContext} from "./log-context.js";
 import type {LogStore} from "./log-context.js";
 import type {IEntityProjectionProvider, EntityProjectionConfig, EntityTaskProjection} from "./entity/IEntityProjectionProvider.js";
 import {buildProjection, syncProjections} from "./entity/IEntityProjectionProvider.js";
+import type {FlowMiddleware} from "./flow/FlowMiddleware.js";
 
 export interface AsyncTask<ID> {
     task: CronTask<ID>;
@@ -39,7 +40,8 @@ export class TaskRunner<ID> {
         private lifecycleProvider?: ITaskLifecycleProvider,
         private lifecycleConfig?: TaskHandlerLifecycleConfig,
         private entityProjection?: IEntityProjectionProvider<ID>,
-        private entityProjectionConfig?: EntityProjectionConfig
+        private entityProjectionConfig?: EntityProjectionConfig,
+        private flowMiddleware?: FlowMiddleware<ID>
     ) {
         this.logger = new Logger('TaskRunner', LogLevel.INFO);
         this.lockManager = new LockManager(cacheProvider, {
@@ -87,7 +89,7 @@ export class TaskRunner<ID> {
 
         if (abortSignal?.aborted) {
             this.logger.info(`[${taskRunnerId}] AbortSignal already aborted, returning empty results`);
-            return {successTasks: [], failedTasks: [], newTasks: [], ignoredTasks: [], asyncTasks: []};
+            return {successTasks: [], failedTasks: [], newTasks: [], ignoredTasks: [], asyncTasks: [], flowProjections: []};
         }
 
         const tasks = await this.lockManager.filterLocked(tasksRaw, tId);
@@ -332,7 +334,7 @@ export class TaskRunner<ID> {
                                             this.emitTaskFailed(t, taskRunnerId, error, willRetry);
                                         }
                                     } : undefined;
-                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId, asyncLifecycleEmitter, this.entityProjection, this.entityProjectionConfig);
+                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId, asyncLifecycleEmitter, this.entityProjection, this.entityProjectionConfig, this.flowMiddleware);
 
                                     const asyncPromise = taskPromise
                                         .finally(async () => {

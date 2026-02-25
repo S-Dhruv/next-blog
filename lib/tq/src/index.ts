@@ -37,6 +37,9 @@ export type {LogStore} from "./core/log-context.js";
 // Entity projection (RFC-003)
 export * from "./core/entity/index.js";
 
+// Flow orchestration (RFC-002)
+export * from "./core/flow/index.js";
+
 // Utilities
 export * from "./utils/task-id-gen.js";
 
