@@ -13,6 +13,7 @@ Built on top of `@supergrowthai/mq` for flexible message queue backends.
 - **Named Exports**: Tree-shakable, explicit imports
 - **Fail-Fast Design**: Required dependencies enforce proper configuration
 - **Entity Projection**: Automatic entity-task status tracking for dashboards and orchestration
+- **Flow Orchestration**: Built-in fan-out/fan-in with barrier tracking, failure policies, and timeouts
 
 ## Installation
 
@@ -563,6 +564,142 @@ const taskHandler = new TaskHandler(
 - **Async-aware**: Async tasks (via `handoffTimeout`) emit terminal projections from `AsyncActions` when the promise resolves.
 - **Fail-fast on misconfiguration**: Entity tasks without an ID throw immediately with an actionable fix, rather than silently producing broken projections.
 
+## Flow Orchestration
+
+Fan-out/fan-in flow orchestration built into the task pipeline. Dispatch N parallel steps, track completion via a barrier, and automatically dispatch a join task when all steps complete.
+
+### How It Works
+
+```
+actions.startFlow()
+  -> fan-out: [images.resize, video.transcode, metadata.validate]
+  -> barrier: tracks completion of all 3 steps
+  -> fan-in:  item.process.completed (receives merged results)
+```
+
+Steps execute as normal tasks with no awareness of the flow. The framework handles barrier tracking and join dispatch via `FlowMiddleware` in the post-processing pipeline.
+
+### Starting a Flow
+
+```typescript
+const flowId = actions.startFlow({
+    steps: [
+        { type: 'images.resize', queue_id: 'media', payload: { imageId: 'img_1' } },
+        { type: 'video.transcode', queue_id: 'media', payload: { videoId: 'vid_1' } },
+        { type: 'metadata.validate', queue_id: 'default', payload: { itemId: 'item_1' } },
+    ],
+    config: {
+        join: { type: 'item.process.completed', queue_id: 'default' },
+        failure_policy: 'continue',  // or 'abort'
+        timeout_ms: 300000,          // optional — 5 minute deadline
+        entity: { id: 'item-123', type: 'Item' },  // optional — flow-level entity tracking
+    }
+});
+// flowId is a UUID identifying this flow instance
+```
+
+### Join Task
+
+When the barrier is met, a join task is dispatched with aggregated results in `payload.flow_results`:
+
+```typescript
+taskQueue.register('default', 'item.process.completed', {
+    multiple: false,
+    parallel: false,
+    default_retries: 2,
+    store_on_failure: true,
+
+    async onTask(task, actions) {
+        const results: FlowResults = task.payload.flow_results;
+        // results.steps = [
+        //   { step_index: 0, status: 'success', result: { thumbnails: [...] } },
+        //   { step_index: 1, status: 'success', result: { video_url: '...' } },
+        //   { step_index: 2, status: 'fail', error: 'Validation timeout' }
+        // ]
+
+        if (results.steps.every(s => s.status === 'success')) {
+            actions.success(task, { merged: true });
+        } else {
+            actions.fail(task, 'Some steps failed');
+        }
+    }
+});
+```
+
+### Failure Policies
+
+| Policy | Behavior |
+|--------|----------|
+| `continue` (default) | Failed steps still decrement the barrier. Join receives mixed results. Join executor decides what to do. |
+| `abort` | On first final failure, join is dispatched immediately with partial results and `aborted: true`. Remaining step completions become no-ops. |
+
+### Timeout
+
+When `timeout_ms` is set, a sentinel task is created that fires after the deadline. If the barrier hasn't been met by then, the join is dispatched with partial results and `timed_out: true`. If the barrier was already met, the timeout is a no-op.
+
+### Barrier Provider
+
+Flow barrier tracking requires an `IFlowBarrierProvider`. An `InMemoryFlowBarrierProvider` is included for testing. For production, implement a Redis-backed provider with atomic Lua scripts for deduplication (HSETNX) and batch decrement.
+
+```typescript
+import { IFlowBarrierProvider, BarrierDecrementResult, FlowStepResult } from '@supergrowthai/tq';
+
+class RedisFlowBarrierProvider implements IFlowBarrierProvider {
+    async initBarrier(flowId: string, totalSteps: number): Promise<void> { /* ... */ }
+    async batchDecrementAndCheck(flowId: string, results: FlowStepResult[]): Promise<BarrierDecrementResult> { /* ... */ }
+    async getStepResults(flowId: string): Promise<FlowStepResult[]> { /* ... */ }
+    async markAborted(flowId: string): Promise<boolean> { /* ... */ }
+    async isComplete(flowId: string): Promise<boolean> { /* ... */ }
+}
+```
+
+`BarrierDecrementResult.remaining`: `0` = barrier met (dispatch join), `>0` = steps pending, `-1` = already complete/aborted (no-op).
+
+### Wiring It Up
+
+```typescript
+import { FlowMiddleware, InMemoryFlowBarrierProvider } from '@supergrowthai/tq';
+
+const barrierProvider = new InMemoryFlowBarrierProvider(); // or your Redis impl
+const flowMiddleware = new FlowMiddleware(barrierProvider, generateId);
+
+const taskHandler = new TaskHandler(
+    messageQueue,
+    taskQueue,
+    databaseAdapter,
+    cacheAdapter,
+    asyncTaskManager,
+    notificationProvider,
+    {
+        lifecycleProvider: myLifecycleProvider,
+        workerProvider: myWorkerProvider,
+        entityProjection: myProjectionProvider,
+        flowMiddleware,  // RFC-002
+    }
+);
+```
+
+### Entity Tracking on Flows
+
+When `config.entity` is provided, the flow lifecycle is projected through the same entity projection system (RFC-003):
+
+| Event | Projection Status |
+|-------|-------------------|
+| `startFlow()` called | `processing` (keyed on `flow_id`) |
+| Join task succeeds | `executed` |
+| Join task fails / abort / timeout | `failed` |
+
+Individual step tasks do **not** carry `CronTask.entity` — entity tracking is at the flow level, avoiding N separate projection rows per step.
+
+### Design Decisions
+
+- **Flow metadata in `metadata.flow_meta`**: User payload is never polluted. Framework data lives in the `metadata` namespace alongside `log_context` (RFC-005).
+- **Batch barrier operations**: Multiple steps from the same flow completing in one processing cycle are batched into a single barrier call.
+- **HSETNX deduplication**: At-least-once MQ delivery means duplicate step completions are safely ignored via set-if-not-exists semantics.
+- **FlowMiddleware returns data, doesn't write**: Returns `{ joinTasks, projections }` to `TaskHandler`, which owns all writes. Clean separation of concerns.
+- **Nested flows**: A join executor can call `actions.startFlow()` to start another flow. Flow IDs are independent UUIDs — no special handling needed.
+- **IMultiTaskExecutor optimization**: Flow steps of the same type in the same processing cycle batch into a single executor call automatically via `TaskRunner`'s existing grouping logic.
+
 ## Error Handling and Retries
 
 ```typescript
@@ -701,7 +838,8 @@ Full TypeScript definitions with generic task types:
 ```typescript
 import type {
     TaskExecutor, ExecutorActions, CronTask, AsyncTaskManagerOptions, ShutdownResult,
-    IEntityProjectionProvider, EntityTaskProjection, EntityProjectionConfig
+    IEntityProjectionProvider, EntityTaskProjection, EntityProjectionConfig,
+    StartFlowInput, FlowResults, FlowMeta, IFlowBarrierProvider
 } from '@supergrowthai/tq';
 
 // Define your task data type
