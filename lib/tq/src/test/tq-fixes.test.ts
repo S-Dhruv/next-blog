@@ -693,10 +693,11 @@ describe("T8 integration: failed tasks enter postProcessTasks retry pipeline", (
         // Wait for processing
         await new Promise(resolve => setTimeout(resolve, 2000));
 
-        // Task should be scheduled for retry (status = 'scheduled', retry_count > 0)
+        // Task should be in retry pipeline: DB status='processing' (blocks mature poller
+        // from double-picking), MQ has the retry with status='scheduled'.
         const [stored] = await databaseAdapter.getTasksByIds([taskId]);
         expect(stored).toBeDefined();
-        expect(stored.status).toBe('scheduled');
+        expect(stored.status).toBe('processing');
         expect(stored.execution_stats?.retry_count).toBeGreaterThan(0);
 
         await messageQueue.shutdown();

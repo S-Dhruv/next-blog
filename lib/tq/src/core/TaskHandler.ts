@@ -151,9 +151,6 @@ export class TaskHandler<ID> {
         // Validate log_context on all tasks (RFC-005)
         tasks = tasks.map(t => this.validateLogContext(t));
 
-        // RFC-003: Collect enriched (ID-bearing) tasks for entity projection
-        const enrichedTasks: CronTask<ID>[] = [];
-
         const diffedItems = tasks.reduce(
             (acc, {force_store, ...task}) => {
                 const currentTime = new Date();
@@ -196,8 +193,22 @@ export class TaskHandler<ID> {
                     return ({...id, ...task, ...(partitionKey ? {partition_key: partitionKey} : {})});
                 });
 
+            // RFC-003: Write 'scheduled' projections BEFORE addMessages to prevent
+            // terminal projection overwrite in immediate/synchronous execution mode.
+            if (this.entityProjectionProvider) {
+                try {
+                    const includePayload = this.config.entityProjectionConfig?.includePayload;
+                    const entityProjections = queueTasks
+                        .filter(t => t.entity)
+                        .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                        .filter((p): p is EntityTaskProjection => p !== null);
+                    await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+                } catch (err) {
+                    this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+                }
+            }
+
             await this.messageQueue.addMessages(queue, queueTasks as unknown as CronTask<ID>[]);
-            enrichedTasks.push(...queueTasks);
 
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
@@ -227,6 +238,21 @@ export class TaskHandler<ID> {
 
             await this.taskStore.addTasksToScheduled(queueTasks);
 
+            // RFC-003: Write 'scheduled' projections BEFORE addMessages to prevent
+            // terminal projection overwrite in immediate/synchronous execution mode.
+            if (this.entityProjectionProvider) {
+                try {
+                    const includePayload = this.config.entityProjectionConfig?.includePayload;
+                    const entityProjections = queueTasks
+                        .filter(t => t.entity)
+                        .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                        .filter((p): p is EntityTaskProjection => p !== null);
+                    await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+                } catch (err) {
+                    this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+                }
+            }
+
             // Send to MQ with 'scheduled' status — DB-backed adapters (MongoDB, Prisma) filter
             // by status:'scheduled', so the message must use that status for consumption.
             // The Task DB retains status:'processing' to block the mature poller.
@@ -246,8 +272,6 @@ export class TaskHandler<ID> {
                 }
                 throw mqError;
             }
-
-            enrichedTasks.push(...queueTasks);
 
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
@@ -271,7 +295,20 @@ export class TaskHandler<ID> {
                     return ({...id, ...task});
                 });
             await this.taskStore.addTasksToScheduled(queueTasks);
-            enrichedTasks.push(...queueTasks);
+
+            // RFC-003: Write 'scheduled' projections for future tasks after DB persistence.
+            if (this.entityProjectionProvider) {
+                try {
+                    const includePayload = this.config.entityProjectionConfig?.includePayload;
+                    const entityProjections = queueTasks
+                        .filter(t => t.entity)
+                        .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                        .filter((p): p is EntityTaskProjection => p !== null);
+                    await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+                } catch (err) {
+                    this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+                }
+            }
 
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
@@ -281,20 +318,6 @@ export class TaskHandler<ID> {
                         this.buildTaskContext(task)
                     );
                 }
-            }
-        }
-
-        // RFC-003: Emit 'scheduled' entity projections for enriched (ID-bearing) entity tasks
-        if (this.entityProjectionProvider) {
-            try {
-                const includePayload = this.config.entityProjectionConfig?.includePayload;
-                const entityProjections = enrichedTasks
-                    .filter(t => t.entity)
-                    .map(t => buildProjection(t, 'scheduled', {includePayload}))
-                    .filter((p): p is EntityTaskProjection => p !== null);
-                await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
-            } catch (err) {
-                this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
             }
         }
     }
@@ -388,7 +411,35 @@ export class TaskHandler<ID> {
         }
 
         if (tasksToRetry.length > 0) {
-            await this.taskStore.updateTasksForRetry(tasksToRetry);
+            // Persist to DB with 'processing' status to block processMatureTasks from
+            // double-picking. Follows the same pattern as forceStoreImmediate (line ~236).
+            const dbRetryTasks = tasksToRetry.map(t => ({
+                ...t,
+                status: 'processing' as const,
+                processing_started_at: new Date()
+            }));
+            await this.taskStore.updateTasksForRetry(dbRetryTasks);
+
+            // Re-enqueue to MQ so consumers can pick them up without waiting for
+            // the processMatureTasks polling loop. DB-backed MQ adapters (MongoDB,
+            // Prisma) gate on execute_at, so future-timed retries wait until ready.
+            // ImmediateQueue and Kinesis execute immediately (backoff not enforced
+            // at MQ layer — acceptable for test/stream modes).
+            const retryByQueue = new Map<QueueName, CronTask<ID>[]>();
+            for (const task of tasksToRetry) {
+                const queue = task.queue_id as QueueName;
+                if (!retryByQueue.has(queue)) retryByQueue.set(queue, []);
+                retryByQueue.get(queue)!.push(task);
+            }
+            for (const [queue, retryQueueTasks] of retryByQueue) {
+                try {
+                    await this.messageQueue.addMessages(queue, retryQueueTasks as unknown as CronTask<ID>[]);
+                } catch (mqErr) {
+                    // MQ failed — DB still has status:'processing'. Stale recovery
+                    // (2-day timeout) will reset to 'scheduled' as a last resort.
+                    this.logger.error(`[TQ] Failed to re-enqueue retry tasks to MQ (stale recovery will handle): ${mqErr}`);
+                }
+            }
         }
 
         if (finalFailedTasks.length > 0) {
