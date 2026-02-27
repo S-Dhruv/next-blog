@@ -25,6 +25,21 @@ const logger = new Logger('ImmediateQueue', LogLevel.INFO);
  * @important A processor MUST be registered via consumeMessagesStream BEFORE
  * calling addMessages, otherwise an error will be thrown.
  *
+ * ## execute_at / backoff behavior (design decision)
+ *
+ * ImmediateQueue does NOT respect `execute_at`. All messages — including retry
+ * tasks with future `execute_at` — are processed immediately inside addMessages().
+ * This is intentional:
+ *
+ * - **Why not defer?** Adding setTimeout/deferred delivery was considered but adds
+ *   complexity (timer management, cleanup on shutdown) for a test-only queue.
+ * - **Retry tasks work correctly:** TaskHandler's postProcessTasks re-enqueues
+ *   retries to MQ after persisting to DB with status='processing'. ImmediateQueue
+ *   fires them immediately, which means exponential backoff delays are not enforced.
+ *   This is acceptable for test/dev usage.
+ * - **For backoff-sensitive tests:** Use InMemoryQueue instead, which gates on
+ *   `execute_at <= now` in its consume loop and correctly enforces retry delays.
+ *
  * @example
  * ```typescript
  * const queue = new ImmediateQueue();
@@ -80,6 +95,12 @@ export class ImmediateQueue<ID> implements IMessageQueue<ID> {
                     }
                 );
             }
+        }
+
+        // Warn about deferred tasks — ImmediateQueue processes everything synchronously
+        const deferredCount = messages.filter(m => m.execute_at && m.execute_at > new Date()).length;
+        if (deferredCount > 0) {
+            logger.warn(`[ImmediateQueue] ${deferredCount} message(s) have future execute_at but will be processed immediately. Use InMemoryQueue for testing deferred or retry-with-backoff scenarios.`);
         }
 
         logger.info(`Added ${messages.length} messages to immediate queue ${queueId}`);

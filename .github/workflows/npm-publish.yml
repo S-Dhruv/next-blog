@@ -56,11 +56,20 @@ jobs:
         run: bun run build:lib
 
       - name: Build plugins
+        if: inputs.publish_target == 'packages' || inputs.publish_target == 'both'
         run: bun --filter="@plugins/*" run build
 
-      - name: Run typecheck
-        run: |
-          bun --filter="*" run typecheck
+      - name: Run typecheck (packages)
+        if: inputs.publish_target == 'packages' || inputs.publish_target == 'both'
+        run: bun run typecheck:packages
+
+      - name: Run typecheck (lib)
+        if: inputs.publish_target == 'lib' || inputs.publish_target == 'both'
+        run: bun run typecheck:lib
+
+      - name: Run typecheck (plugins)
+        if: inputs.publish_target == 'packages' || inputs.publish_target == 'both'
+        run: bun run typecheck:plugins
 
       - name: Version and publish types
         if: inputs.publish_target == 'packages' || inputs.publish_target == 'both'

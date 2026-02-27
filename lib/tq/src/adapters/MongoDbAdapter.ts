@@ -91,7 +91,10 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
             task_hash: task.task_hash,
             retry_after: task.retry_after,
             execution_stats: task.execution_stats,
-            force_store: task.force_store
+            force_store: task.force_store,
+            metadata: task.metadata,
+            partition_key: task.partition_key,
+            entity: task.entity
         }));
 
         try {
@@ -109,6 +112,8 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
         }
     }
 
+    // TODO(P3): Use findOneAndUpdate for atomic claim instead of find() + update().
+    //   Multiple workers can pick up the same tasks. Dedup via cache is best-effort.
     async getMatureTasks(timestamp: number): Promise<CronTask<ObjectId>[]> {
         const collection = await this.collection;
 
@@ -169,34 +174,34 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
 
     async markTasksAsExecuted(tasks: CronTask<ObjectId>[]): Promise<void> {
         const collection = await this.collection;
-        const taskIds = tasks.map(t => t.id).filter(Boolean) as ObjectId[];
+        const tasksWithIds = tasks.filter(t => t.id);
+        if (!tasksWithIds.length) return;
 
+        const now = new Date();
+        const hasAnyResult = tasksWithIds.some(t => t.execution_result !== undefined);
 
-        await collection.updateMany(
-            {_id: {$in: taskIds}},
-            {
-                $set: {
-                    status: 'executed',
-                    updated_at: new Date()
+        if (hasAnyResult) {
+            // Any task carries a result → unified bulkWrite for entire batch (1 round-trip)
+            const bulkOps = tasksWithIds.map(t => ({
+                updateOne: {
+                    filter: {_id: t.id!},
+                    update: {
+                        $set: {
+                            status: 'executed' as const,
+                            updated_at: now,
+                            ...(t.execution_result !== undefined && {execution_result: t.execution_result})
+                        }
+                    }
                 }
-            }
-        );
-    }
-
-    async markTasksAsFailed(tasks: CronTask<ObjectId>[]): Promise<void> {
-        const collection = await this.collection;
-        const taskIds = tasks.map(t => t.id).filter(Boolean) as ObjectId[];
-
-
-        await collection.updateMany(
-            {_id: {$in: taskIds}},
-            {
-                $set: {
-                    status: 'failed',
-                    updated_at: new Date()
-                }
-            }
-        );
+            }));
+            await collection.bulkWrite(bulkOps, {ordered: false});
+        } else {
+            // No results in batch → single updateMany (1 server op, 1 round-trip)
+            await collection.updateMany(
+                {_id: {$in: tasksWithIds.map(t => t.id!)}},
+                {$set: {status: 'executed', updated_at: now}}
+            );
+        }
     }
 
     async getTasksByIds(taskIds: ObjectId[]): Promise<CronTask<ObjectId>[]> {
@@ -303,20 +308,4 @@ export abstract class MongoDbAdapter implements ITaskStorageAdapter<ObjectId> {
     async initialize() {
     }
 
-    async markTasksAsIgnored(tasks: CronTask<ObjectId>[]): Promise<void> {
-        const collection = await this.collection;
-        const taskIds = tasks.map(t => t.id).filter(Boolean) as ObjectId[];
-
-
-        await collection.updateMany(
-            {_id: {$in: taskIds}},
-            {
-                $set: {
-                    status: 'ignored',
-                    //update execution_stats
-                    updated_at: new Date()
-                },
-            }
-        );
-    }
 }

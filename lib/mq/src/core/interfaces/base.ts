@@ -1,5 +1,13 @@
 import {QueueName, TypedMessage} from "../types.js";
 
+/** Framework metadata namespace on messages — keeps non-business fields off payload */
+export interface MessageMetadata {
+    /** User-provided key-value pairs for log correlation (RFC-005) */
+    log_context?: Record<string, string>;
+    /** Flow orchestration metadata (RFC-002) — opaque at mq layer, cast to FlowMeta in tq */
+    flow_meta?: Record<string, unknown>;
+}
+
 /**
  * Base message structure required by the message queue system
  */
@@ -18,6 +26,12 @@ export type BaseMessage<ID = any> = TypedMessage & {
     processing_started_at?: Date;
     force_store?: boolean;
     execution_stats?: Record<string, unknown>;
+
+    /** Executor-defined override for Kinesis partition key */
+    partition_key?: string;
+
+    /** Framework metadata (log_context, future: tracing, priority, flow orchestration) */
+    metadata?: MessageMetadata;
 };
 
 /**

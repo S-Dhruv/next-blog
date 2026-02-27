@@ -1,5 +1,7 @@
 import {CronTask} from "../../adapters";
 import {MessageType, TypedMessage} from "@supergrowthai/mq";
+import {Logger} from "@supergrowthai/utils";
+import type {StartFlowInput} from "../flow/types.js";
 
 /**
  * Type helper to extract the correct CronTask type based on message type
@@ -14,12 +16,18 @@ interface IBaseExecutor {
         handoffTimeout: number;  // ms before handoff to async (e.g., 5000 for 5 seconds)
         maxConcurrentAsync?: number;  // max concurrent async tasks of this type
     }
+    /** Optional static partition key for ordering guarantees (e.g., return payload.user_id) */
+    getPartitionKey?: (task: CronTask<any>) => string;
 }
 
 export type ExecutorActions<ID = any> = {
     addTasks(task: CronTask<ID>[]): void;
-    fail(task: CronTask<ID>): void;
-    success(task: CronTask<ID>): void;
+    fail(task: CronTask<ID>, error?: Error | string, meta?: Record<string, unknown>): void;
+    success(task: CronTask<ID>, result?: unknown): void;
+    /** Fan-out/fan-in flow orchestration (RFC-002) */
+    startFlow(input: StartFlowInput): string;
+    /** Child logger scoped to this task's log_context (RFC-005) */
+    readonly log: Logger;
 }
 
 export interface IMultiTaskExecutor<ID = any, T extends MessageType = MessageType> extends IBaseExecutor {

@@ -85,17 +85,9 @@ class InMemoryAdapter implements ITaskStorageAdapter<string> {
             if (existingTask) {
                 existingTask.status = 'executed';
                 existingTask.execute_at = new Date();
-                this.scheduledTasks.set(task.id!, existingTask);
-            }
-        }
-    }
-
-    async markTasksAsFailed(tasks: CronTask<string>[]): Promise<void> {
-        for (const task of tasks) {
-            const existingTask = this.scheduledTasks.get(task.id!);
-            if (existingTask) {
-                existingTask.status = 'failed';
-                existingTask.execution_stats = {...existingTask.execution_stats, failed_at: new Date()};
+                if (task.execution_result !== undefined) {
+                    existingTask.execution_result = task.execution_result;
+                }
                 this.scheduledTasks.set(task.id!, existingTask);
             }
         }
@@ -173,16 +165,6 @@ class InMemoryAdapter implements ITaskStorageAdapter<string> {
         return `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     }
 
-    async markTasksAsIgnored(tasks: CronTask<string>[]) {
-        for (const task of tasks) {
-            const existingTask = this.scheduledTasks.get(task.id!);
-            if (existingTask) {
-                existingTask.status = 'ignored';
-                existingTask.execution_stats = {...existingTask.execution_stats, ignore_reason: "unknown type"};
-                this.scheduledTasks.set(task.id!, existingTask);
-            }
-        }
-    }
 }
 
 export {InMemoryAdapter}

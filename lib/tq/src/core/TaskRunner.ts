@@ -13,6 +13,11 @@ import {TaskQueuesManager} from "./TaskQueuesManager";
 import {TaskStore} from "./TaskStore";
 import {IAsyncTaskManager} from "./async/async-task-manager";
 import type {ITaskLifecycleProvider, TaskContext, TaskHandlerLifecycleConfig, TaskTiming} from "./lifecycle.js";
+import {runWithLogContext} from "./log-context.js";
+import type {LogStore} from "./log-context.js";
+import type {IEntityProjectionProvider, EntityProjectionConfig, EntityTaskProjection} from "./entity/IEntityProjectionProvider.js";
+import {buildProjection, syncProjections} from "./entity/IEntityProjectionProvider.js";
+import type {FlowMiddleware} from "./flow/FlowMiddleware.js";
 
 export interface AsyncTask<ID> {
     task: CronTask<ID>;
@@ -33,13 +38,42 @@ export class TaskRunner<ID> {
         cacheProvider: CacheProvider<any>,
         private generateId: () => ID,
         private lifecycleProvider?: ITaskLifecycleProvider,
-        private lifecycleConfig?: TaskHandlerLifecycleConfig
+        private lifecycleConfig?: TaskHandlerLifecycleConfig,
+        private entityProjection?: IEntityProjectionProvider<ID>,
+        private entityProjectionConfig?: EntityProjectionConfig,
+        private flowMiddleware?: FlowMiddleware<ID>
     ) {
         this.logger = new Logger('TaskRunner', LogLevel.INFO);
         this.lockManager = new LockManager(cacheProvider, {
             prefix: "task_lock_",
             defaultTimeout: 30 * 60
         });
+    }
+
+    // ============ Log Context Helpers (RFC-005) ============
+
+    /**
+     * Build ALS log store for a single task execution.
+     * Runtime keys (task_id, task_type, worker_id) override user-supplied log_context.
+     */
+    private buildLogStore(task: CronTask<ID>, workerId: string): LogStore {
+        return {
+            ...(task.metadata?.log_context || {}),
+            task_id: task.id?.toString() || tId(task),
+            task_type: task.type,
+            worker_id: workerId,
+        };
+    }
+
+    /**
+     * Build ALS log store for a multi-task (batch) execution.
+     * Only runtime keys — no user log_context (ambiguous across tasks).
+     */
+    private buildBatchLogStore(tasks: CronTask<ID>[], workerId: string): LogStore {
+        return {
+            worker_id: workerId,
+            batch_size: String(tasks.length),
+        };
     }
 
     // ============ Lifecycle Helpers ============
@@ -55,7 +89,7 @@ export class TaskRunner<ID> {
 
         if (abortSignal?.aborted) {
             this.logger.info(`[${taskRunnerId}] AbortSignal already aborted, returning empty results`);
-            return {successTasks: [], failedTasks: [], newTasks: [], ignoredTasks: [], asyncTasks: []};
+            return {successTasks: [], failedTasks: [], newTasks: [], ignoredTasks: [], asyncTasks: [], flowProjections: []};
         }
 
         const tasks = await this.lockManager.filterLocked(tasksRaw, tId);
@@ -89,6 +123,19 @@ export class TaskRunner<ID> {
         }, [] as { type: TaskType, tasks: CronTask<ID>[] }[]);
 
         this.logger.info(`[${taskRunnerId}] Task groups: ${groupedTasksArray.map(g => `${g.type}: ${g.tasks.length}`).join(', ')}`);
+
+        // RFC-003: Emit 'processing' projection for first-attempt entity tasks
+        if (this.entityProjection) {
+            try {
+                const processingProjections = tasks
+                    .filter(t => t.entity && !t.execution_stats?.retry_count)
+                    .map(t => buildProjection(t, 'processing', {includePayload: this.entityProjectionConfig?.includePayload}))
+                    .filter((p): p is EntityTaskProjection<ID> => p !== null);
+                await syncProjections(processingProjections, this.entityProjection, this.logger);
+            } catch (err) {
+                this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+            }
+        }
 
         const actions = new Actions<ID>(taskRunnerId);
         const asyncTasks: AsyncTask<ID>[] = [];
@@ -137,7 +184,17 @@ export class TaskRunner<ID> {
             this.logger.info(`[${taskRunnerId}] Processing ${taskGroup.tasks.length} tasks of type: ${taskGroup.type}`);
 
             if (executor.multiple) {
-                await executor.onTasks(taskGroup.tasks as any[], actions).catch(err => this.logger.error(`[${taskRunnerId}] executor.onTasks failed: ${err}`))
+                const batchStore = this.buildBatchLogStore(taskGroup.tasks, taskRunnerId);
+                await runWithLogContext(batchStore, () =>
+                    executor.onTasks(taskGroup.tasks as any[], actions).catch(err => {
+                        this.logger.error(`[${taskRunnerId}] executor.onTasks failed: ${err}`);
+                        for (const task of taskGroup.tasks) {
+                            if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                            }
+                        }
+                    })
+                );
             } else {
                 if (executor.parallel) {
                     const chunks = chunk(taskGroup.tasks, executor.chunkSize) as CronTask<ID>[][];
@@ -150,8 +207,17 @@ export class TaskRunner<ID> {
 
                         const chunkPromises: Promise<void>[] = [];
                         for (let j = 0; j < taskChunk.length; j++) {
-                            const taskActions = actions.forkForTask(taskChunk[j]);
-                            chunkPromises.push(executor.onTask(taskChunk[j], taskActions).catch(err => this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`)));
+                            const task = taskChunk[j];
+                            const taskActions = actions.forkForTask(task);
+                            const logStore = this.buildLogStore(task, taskRunnerId);
+                            chunkPromises.push(runWithLogContext(logStore, () =>
+                                executor.onTask(task, taskActions).catch(err => {
+                                    this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
+                                    if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                        actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                                    }
+                                })
+                            ));
                         }
                         await Promise.all(chunkPromises);
 
@@ -159,7 +225,7 @@ export class TaskRunner<ID> {
                         for (const task of taskChunk) {
                             const resultStatus = actions.getTaskResultStatus(tId(task));
                             if (resultStatus === 'success') {
-                                this.emitTaskCompleted(task, taskRunnerId);
+                                this.emitTaskCompleted(task, taskRunnerId, actions.getTaskResult(tId(task)));
                             } else if (resultStatus === 'fail') {
                                 const retryCount = (task.execution_stats?.retry_count as number) || 0;
                                 const maxRetries = task.retries ?? executor.default_retries ?? 0;
@@ -179,12 +245,20 @@ export class TaskRunner<ID> {
                             this.emitTaskStarted(task, taskRunnerId);
 
                             const taskActions = actions.forkForTask(task);
-                            await executor.onTask(task, taskActions).catch(err => this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`));
+                            const logStore = this.buildLogStore(task, taskRunnerId);
+                            await runWithLogContext(logStore, () =>
+                                executor.onTask(task, taskActions).catch(err => {
+                                    this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
+                                    if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                        actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                                    }
+                                })
+                            );
 
                             // Emit completion event based on result
                             const resultStatus = actions.getTaskResultStatus(tId(task));
                             if (resultStatus === 'success') {
-                                this.emitTaskCompleted(task, taskRunnerId);
+                                this.emitTaskCompleted(task, taskRunnerId, actions.getTaskResult(tId(task)));
                             } else if (resultStatus === 'fail') {
                                 const retryCount = (task.execution_stats?.retry_count as number) || 0;
                                 const maxRetries = task.retries ?? executor.default_retries ?? 0;
@@ -199,10 +273,16 @@ export class TaskRunner<ID> {
                             let isTimedOut = false;
 
                             const taskActions = actions.forkForTask(task);
+                            const logStore = this.buildLogStore(task, taskRunnerId);
 
-                            const taskPromise = executor.onTask(task, taskActions).catch(err => {
-                                this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
-                            });
+                            const taskPromise = runWithLogContext(logStore, () =>
+                                executor.onTask(task, taskActions).catch(err => {
+                                    this.logger.error(`[${taskRunnerId}] executor.onTask failed: ${err}`);
+                                    if (actions.getTaskResultStatus(tId(task)) === 'pending') {
+                                        actions.fail(task, err instanceof Error ? err : new Error(String(err)));
+                                    }
+                                })
+                            );
 
                             let timeoutId: NodeJS.Timeout | undefined;
                             const timeoutPromise = new Promise<'~~~timeout'>(resolve => {
@@ -227,7 +307,7 @@ export class TaskRunner<ID> {
                                 // Task completed before timeout - emit lifecycle event
                                 const resultStatus = actions.getTaskResultStatus(tId(task));
                                 if (resultStatus === 'success') {
-                                    this.emitTaskCompleted(task, taskRunnerId);
+                                    this.emitTaskCompleted(task, taskRunnerId, actions.getTaskResult(tId(task)));
                                 } else if (resultStatus === 'fail') {
                                     const retryCount = (task.execution_stats?.retry_count as number) || 0;
                                     const maxRetries = task.retries ?? executor.default_retries ?? 0;
@@ -246,7 +326,15 @@ export class TaskRunner<ID> {
                                 if (!task.id) {
                                     this.logger.error(`[${taskRunnerId}] Cannot hand off task without id (type: ${task.type}). Task will continue but won't be tracked.`);
                                 } else {
-                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId);
+                                    const asyncLifecycleEmitter = this.lifecycleProvider ? {
+                                        onCompleted: (t: CronTask<ID>, result?: unknown) => {
+                                            this.emitTaskCompleted(t, taskRunnerId, result);
+                                        },
+                                        onFailed: (t: CronTask<ID>, error: Error, willRetry: boolean) => {
+                                            this.emitTaskFailed(t, taskRunnerId, error, willRetry);
+                                        }
+                                    } : undefined;
+                                    const asyncActions = new AsyncActions<ID>(this.messageQueue, this.taskStore, this.taskQueue, actions, task, this.generateId, asyncLifecycleEmitter, this.entityProjection, this.entityProjectionConfig, this.flowMiddleware);
 
                                     const asyncPromise = taskPromise
                                         .finally(async () => {
@@ -315,7 +403,8 @@ export class TaskRunner<ID> {
             attempt: retryCount + 1,
             max_retries: maxRetries,
             scheduled_at: task.created_at || new Date(),
-            worker_id: workerId
+            worker_id: workerId,
+            log_context: task.metadata?.log_context,
         };
     }
 

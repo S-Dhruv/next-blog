@@ -5,11 +5,13 @@ import {getEnabledQueues} from "./environment.js";
 import moment from "moment";
 import type {MessageConsumer} from "@supergrowthai/mq";
 import {IMessageQueue, QueueName} from "@supergrowthai/mq";
+import type {MessageMetadata} from "@supergrowthai/mq";
 import {ProcessedTaskResult} from "./task-processor-types.js";
 import {CronTask, ITaskStorageAdapter} from "../adapters";
 import type {CacheProvider} from "memoose-js";
 import {TaskQueuesManager} from "./TaskQueuesManager";
 import {IAsyncTaskManager} from "./async/async-task-manager";
+import type {AsyncTask} from "./TaskRunner.js";
 import {
     DiscardedTaskInfo,
     ITaskNotificationProvider,
@@ -24,6 +26,8 @@ import type {
     WorkerInfo,
     WorkerStats
 } from "./lifecycle.js";
+import type {IEntityProjectionProvider, EntityTaskProjection} from "./entity/IEntityProjectionProvider.js";
+import {buildProjection, syncProjections} from "./entity/IEntityProjectionProvider.js";
 import * as os from "os";
 
 const METRICS_KEY_PREFIX = 'task_metrics:';
@@ -88,7 +92,10 @@ export class TaskHandler<ID> {
             this.cacheAdapter,
             databaseAdapter.generateId.bind(databaseAdapter),
             this.config.lifecycleProvider,
-            this.config.lifecycle
+            this.config.lifecycle,
+            this.config.entityProjection,
+            this.config.entityProjectionConfig,
+            this.config.flowMiddleware
         );
     }
 
@@ -102,7 +109,48 @@ export class TaskHandler<ID> {
         return this.config.workerProvider;
     }
 
+    private get entityProjectionProvider(): IEntityProjectionProvider | undefined {
+        return this.config.entityProjection;
+    }
+
+    /**
+     * Validate and sanitize log_context on a task (RFC-005).
+     * - >10 keys: truncate to first 10 alphabetically, warn
+     * - >1024 bytes total: drop entire context, warn
+     */
+    private validateLogContext(task: CronTask<ID>): CronTask<ID> {
+        const logCtx = task.metadata?.log_context;
+        if (!logCtx) return task;
+
+        let validatedCtx = logCtx;
+        const keys = Object.keys(logCtx).sort();
+
+        // Truncate to 10 keys
+        if (keys.length > 10) {
+            this.logger.warn(`[TQ] log_context has ${keys.length} keys (max 10), truncating for task type ${task.type}`);
+            const truncated: Record<string, string> = {};
+            for (let i = 0; i < 10; i++) truncated[keys[i]] = logCtx[keys[i]];
+            validatedCtx = truncated;
+        }
+
+        // Check total size (1KB limit)
+        const serialized = JSON.stringify(validatedCtx);
+        if (serialized.length > 1024) {
+            this.logger.warn(`[TQ] log_context exceeds 1KB (${serialized.length} chars), dropping for task type ${task.type}`);
+            const {log_context: _, ...restMeta} = task.metadata!;
+            return {...task, metadata: Object.keys(restMeta).length > 0 ? (restMeta as MessageMetadata) : undefined} as CronTask<ID>;
+        }
+
+        if (validatedCtx !== logCtx) {
+            return {...task, metadata: {...task.metadata, log_context: validatedCtx}};
+        }
+        return task;
+    }
+
     async addTasks(tasks: CronTask<ID>[]) {
+        // Validate log_context on all tasks (RFC-005)
+        tasks = tasks.map(t => this.validateLogContext(t));
+
         const diffedItems = tasks.reduce(
             (acc, {force_store, ...task}) => {
                 const currentTime = new Date();
@@ -141,8 +189,24 @@ export class TaskHandler<ID> {
                     const executor = this.taskQueuesManager.getExecutor(task.queue_id, task.type);
                     const shouldStoreOnFailure = executor?.store_on_failure ?? false;
                     const id = shouldStoreOnFailure ? {id: this.databaseAdapter.generateId(),} : {}
-                    return ({...id, ...task});
+                    const partitionKey = executor?.getPartitionKey?.(task);
+                    return ({...id, ...task, ...(partitionKey ? {partition_key: partitionKey} : {})});
                 });
+
+            // RFC-003: Write 'scheduled' projections BEFORE addMessages to prevent
+            // terminal projection overwrite in immediate/synchronous execution mode.
+            if (this.entityProjectionProvider) {
+                try {
+                    const includePayload = this.config.entityProjectionConfig?.includePayload;
+                    const entityProjections = queueTasks
+                        .filter(t => t.entity)
+                        .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                        .filter((p): p is EntityTaskProjection => p !== null);
+                    await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+                } catch (err) {
+                    this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+                }
+            }
 
             await this.messageQueue.addMessages(queue, queueTasks as unknown as CronTask<ID>[]);
 
@@ -157,8 +221,12 @@ export class TaskHandler<ID> {
             }
         }
 
-        // force_store + immediate: persist to DB as 'processing', then send to MQ.
-        // Status is 'processing' so the mature task poller won't re-enqueue these.
+        // force_store + immediate: persist to Task DB as 'processing', then send to MQ.
+        // DB status = 'processing': prevents the mature task poller from re-enqueuing.
+        // MQ status = 'scheduled':  DB-backed MQ adapters (MongoDB, Prisma) only consume
+        //   messages with status:'scheduled', so the MQ copy must use that status.
+        // TODO(D1): Apply getPartitionKey here too (same as immediate path above).
+        //   Currently forceStoreImmediate tasks skip partition key enrichment.
         const fsQueues = Object.keys(diffedItems.forceStoreImmediate) as unknown as QueueName[];
         for (let i = 0; i < fsQueues.length; i++) {
             const queue = fsQueues[i];
@@ -170,8 +238,27 @@ export class TaskHandler<ID> {
 
             await this.taskStore.addTasksToScheduled(queueTasks);
 
+            // RFC-003: Write 'scheduled' projections BEFORE addMessages to prevent
+            // terminal projection overwrite in immediate/synchronous execution mode.
+            if (this.entityProjectionProvider) {
+                try {
+                    const includePayload = this.config.entityProjectionConfig?.includePayload;
+                    const entityProjections = queueTasks
+                        .filter(t => t.entity)
+                        .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                        .filter((p): p is EntityTaskProjection => p !== null);
+                    await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+                } catch (err) {
+                    this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+                }
+            }
+
+            // Send to MQ with 'scheduled' status — DB-backed adapters (MongoDB, Prisma) filter
+            // by status:'scheduled', so the message must use that status for consumption.
+            // The Task DB retains status:'processing' to block the mature poller.
+            const mqTasks = queueTasks.map(t => ({...t, status: 'scheduled' as const}));
             try {
-                await this.messageQueue.addMessages(queue, queueTasks as unknown as CronTask<ID>[]);
+                await this.messageQueue.addMessages(queue, mqTasks as unknown as CronTask<ID>[]);
             } catch (mqError) {
                 // MQ failed after DB write - reset to 'scheduled' so mature poller can pick up
                 this.logger.error(`MQ write failed for forceStoreImmediate tasks, resetting to scheduled: ${mqError}`);
@@ -209,6 +296,20 @@ export class TaskHandler<ID> {
                 });
             await this.taskStore.addTasksToScheduled(queueTasks);
 
+            // RFC-003: Write 'scheduled' projections for future tasks after DB persistence.
+            if (this.entityProjectionProvider) {
+                try {
+                    const includePayload = this.config.entityProjectionConfig?.includePayload;
+                    const entityProjections = queueTasks
+                        .filter(t => t.entity)
+                        .map(t => buildProjection(t, 'scheduled', {includePayload}))
+                        .filter((p): p is EntityTaskProjection => p !== null);
+                    await syncProjections(entityProjections, this.entityProjectionProvider, this.logger);
+                } catch (err) {
+                    this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+                }
+            }
+
             // Emit onTaskScheduled for each task
             if (this.lifecycleProvider?.onTaskScheduled) {
                 for (const task of queueTasks) {
@@ -221,6 +322,9 @@ export class TaskHandler<ID> {
         }
     }
 
+    // TODO(P2): Wrap retry upsert → new tasks → mark failed → mark success in a
+    //   transaction. If an intermediate step fails, tasks can be lost or re-executed
+    //   after 2-day stale recovery. Reorder to mark success first as a quick win.
     async postProcessTasks({
                                failedTasks: failedTasksRaw,
                                newTasks,
@@ -228,14 +332,14 @@ export class TaskHandler<ID> {
                            }: ProcessedTaskResult<ID>) {
         const tasksToRetry: CronTask<ID>[] = [];
         const finalFailedTasks: CronTask<ID>[] = [];
-        let discardedTasksCount = 0;
+        const discardedTasks: CronTask<ID>[] = [];
 
         // Maximum retry delay cap to prevent unbounded delays
         const MAX_RETRY_DELAY_MS = 5 * 60 * 1000; // 5 minutes
 
         for (const task of failedTasksRaw) {
             const taskRetryCount = (task.execution_stats && typeof task.execution_stats.retry_count === 'number') ? task.execution_stats.retry_count : 0;
-            const taskRetryAfter = task.retry_after || 2000;
+            const taskRetryAfter = Math.max(task.retry_after || 2000, 0);
             const calculatedDelay = taskRetryAfter * Math.pow(taskRetryCount + 1, 2);
             const retryAfter = Math.min(calculatedDelay, MAX_RETRY_DELAY_MS);
             const executeAt = Date.now() + retryAfter;
@@ -278,7 +382,7 @@ export class TaskHandler<ID> {
                     }]);
                 }
             } else {
-                discardedTasksCount++;
+                discardedTasks.push(task);
                 this.logger.info(`Discarding task of type ${task.type} after ${taskRetryCount} retries`);
 
                 // Emit onTaskExhausted for discarded tasks
@@ -302,16 +406,40 @@ export class TaskHandler<ID> {
             }
         }
 
-        if (discardedTasksCount > 0) {
-            await this.trackDiscardedTasks(discardedTasksCount);
+        if (discardedTasks.length > 0) {
+            await this.trackDiscardedTasks(discardedTasks.length);
         }
 
         if (tasksToRetry.length > 0) {
-            await this.taskStore.updateTasksForRetry(tasksToRetry);
-        }
+            // Persist to DB with 'processing' status to block processMatureTasks from
+            // double-picking. Follows the same pattern as forceStoreImmediate (line ~236).
+            const dbRetryTasks = tasksToRetry.map(t => ({
+                ...t,
+                status: 'processing' as const,
+                processing_started_at: new Date()
+            }));
+            await this.taskStore.updateTasksForRetry(dbRetryTasks);
 
-        if (newTasks.length > 0) {
-            await this.addTasks(newTasks);
+            // Re-enqueue to MQ so consumers can pick them up without waiting for
+            // the processMatureTasks polling loop. DB-backed MQ adapters (MongoDB,
+            // Prisma) gate on execute_at, so future-timed retries wait until ready.
+            // ImmediateQueue and Kinesis execute immediately (backoff not enforced
+            // at MQ layer — acceptable for test/stream modes).
+            const retryByQueue = new Map<QueueName, CronTask<ID>[]>();
+            for (const task of tasksToRetry) {
+                const queue = task.queue_id as QueueName;
+                if (!retryByQueue.has(queue)) retryByQueue.set(queue, []);
+                retryByQueue.get(queue)!.push(task);
+            }
+            for (const [queue, retryQueueTasks] of retryByQueue) {
+                try {
+                    await this.messageQueue.addMessages(queue, retryQueueTasks as unknown as CronTask<ID>[]);
+                } catch (mqErr) {
+                    // MQ failed — DB still has status:'processing'. Stale recovery
+                    // (2-day timeout) will reset to 'scheduled' as a last resort.
+                    this.logger.error(`[TQ] Failed to re-enqueue retry tasks to MQ (stale recovery will handle): ${mqErr}`);
+                }
+            }
         }
 
         if (finalFailedTasks.length > 0) {
@@ -320,6 +448,73 @@ export class TaskHandler<ID> {
 
         if (successTasks.length > 0) {
             await this.taskStore.markTasksAsSuccess(successTasks);
+        }
+
+        // RFC-003: Emit terminal entity projections
+        if (this.entityProjectionProvider) {
+            try {
+                const includePayload = this.config.entityProjectionConfig?.includePayload;
+                const terminalProjections: EntityTaskProjection[] = [];
+
+                // Success tasks → 'executed'
+                for (const task of successTasks) {
+                    const p = buildProjection(task, 'executed', {
+                        includePayload,
+                        result: task.execution_result,
+                    });
+                    if (p) terminalProjections.push(p);
+                }
+
+                // Final failed tasks (with id, exhausted retries) → 'failed'
+                for (const task of finalFailedTasks) {
+                    const p = buildProjection(task, 'failed', {
+                        includePayload,
+                        error: task.execution_stats?.last_error as string || 'Task failed',
+                    });
+                    if (p) terminalProjections.push(p);
+                }
+
+                // Discarded tasks (no id, exhausted retries) → 'failed'
+                for (const task of discardedTasks) {
+                    try {
+                        const p = buildProjection(task, 'failed', {
+                            includePayload,
+                            error: task.execution_stats?.last_error as string || 'Task exhausted all retries',
+                        });
+                        if (p) terminalProjections.push(p);
+                    } catch (projErr) {
+                        this.logger.error(`[TQ] Entity projection build failed (non-fatal): ${projErr}`);
+                    }
+                }
+
+                await syncProjections(terminalProjections, this.entityProjectionProvider, this.logger);
+            } catch (err) {
+                this.logger.error(`[TQ] Entity projection failed (non-fatal): ${err}`);
+            }
+        }
+
+        // RFC-002: Flow middleware — process completed tasks for barrier tracking and join dispatch
+        if (this.config.flowMiddleware) {
+            try {
+                const flowResult = await this.config.flowMiddleware.onPostProcess({successTasks, failedTasks: finalFailedTasks});
+
+                // Sync flow entity projections
+                if (flowResult.projections.length > 0 && this.entityProjectionProvider) {
+                    await syncProjections(flowResult.projections, this.entityProjectionProvider, this.logger);
+                }
+
+                // Dispatch join tasks
+                if (flowResult.joinTasks.length > 0) {
+                    await this.addTasks(flowResult.joinTasks);
+                }
+            } catch (err) {
+                this.logger.error(`[TQ] Flow middleware failed (non-fatal): ${err}`);
+            }
+        }
+
+        // Dispatch new tasks (executor-spawned child tasks)
+        if (newTasks.length > 0) {
+            await this.addTasks(newTasks);
         }
     }
 
@@ -351,11 +546,19 @@ export class TaskHandler<ID> {
                 newTasks,
                 successTasks,
                 asyncTasks,
-                ignoredTasks
+                ignoredTasks,
+                flowProjections
             } = await this.taskRunner.run(id, tasks, this.asyncTaskManager, abortSignal)
                 .catch(err => {
-                    this.logger.error("Failed to execute tasks?", err);
-                    return {failedTasks: [], newTasks: [], successTasks: [], asyncTasks: [], ignoredTasks: []}
+                    this.logger.error("Failed to execute tasks, returning all as failed for retry:", err);
+                    return {
+                        failedTasks: tasks as CronTask<ID>[],
+                        newTasks: [] as CronTask<ID>[],
+                        successTasks: [] as CronTask<ID>[],
+                        asyncTasks: [] as AsyncTask<ID>[],
+                        ignoredTasks: [] as CronTask<ID>[],
+                        flowProjections: [] as EntityTaskProjection[]
+                    }
                 });
 
             if (asyncTasks.length > 0 && !this.asyncTaskManager) {
@@ -364,7 +567,13 @@ export class TaskHandler<ID> {
             if (asyncTasks.length > 0) {
                 this.logger.info(`Handling ${asyncTasks.length} async tasks for stream ${streamName}`);
                 for (const asyncTask of asyncTasks) {
-                    const accepted = this.asyncTaskManager!.handoffTask(asyncTask.task, asyncTask.promise);
+                    // Get per-task timeout from executor's asyncConfig
+                    const executor = this.taskQueuesManager.getExecutor(asyncTask.task.queue_id, asyncTask.task.type);
+                    const taskTimeout = executor?.asyncConfig?.handoffTimeout
+                        ? executor.asyncConfig.handoffTimeout * 2
+                        : undefined;
+
+                    const accepted = this.asyncTaskManager!.handoffTask(asyncTask.task, asyncTask.promise, taskTimeout);
                     if (!accepted) {
                         this.logger.warn(`Async queue full, requeueing task ${asyncTask.task.id} with 30s delay`);
                         await this.addTasks([{
@@ -381,6 +590,11 @@ export class TaskHandler<ID> {
                     .catch(err => {
                         this.logger.error("Failed to mark tasks as ignored", err)
                     });
+            }
+
+            // RFC-002: Sync flow projections from startFlow calls (processing status, task_id = flow_id)
+            if (this.entityProjectionProvider && flowProjections?.length > 0) {
+                await syncProjections(flowProjections, this.entityProjectionProvider, this.logger);
             }
 
             await this.postProcessTasks({failedTasks, newTasks, successTasks})
@@ -640,7 +854,8 @@ export class TaskHandler<ID> {
             payload: this.config.lifecycle?.include_payload ? payload : {},
             attempt: retryCount + 1,
             max_retries: maxRetries,
-            scheduled_at: task.created_at || new Date()
+            scheduled_at: task.created_at || new Date(),
+            log_context: task.metadata?.log_context,
         };
     }
 

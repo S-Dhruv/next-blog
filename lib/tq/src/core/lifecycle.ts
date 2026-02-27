@@ -2,6 +2,7 @@
  * Task Queue Lifecycle Types
  * Provides interfaces for task and worker lifecycle callbacks
  */
+import type {EntityProjectionConfig, IEntityProjectionProvider} from "./entity/IEntityProjectionProvider.js";
 
 // ============ Task Lifecycle Types ============
 
@@ -24,6 +25,8 @@ export interface TaskContext {
     scheduled_at: Date;
     /** Worker processing this task */
     worker_id?: string;
+    /** User-provided log correlation context (RFC-005) */
+    log_context?: Record<string, string>;
 }
 
 export interface TaskTiming {
@@ -153,4 +156,10 @@ export interface TaskHandlerConfig {
     workerProvider?: IWorkerLifecycleProvider;
     /** Lifecycle callback configuration */
     lifecycle?: TaskHandlerLifecycleConfig;
+    /** RFC-003: Entity-task projection provider */
+    entityProjection?: IEntityProjectionProvider;
+    /** RFC-003: Entity projection configuration */
+    entityProjectionConfig?: EntityProjectionConfig;
+    /** RFC-002: Flow middleware for fan-out/fan-in orchestration */
+    flowMiddleware?: import("./flow/FlowMiddleware.js").FlowMiddleware<any>;
 }

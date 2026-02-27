@@ -167,6 +167,8 @@ export class PrismaAdapter<
         return results;
     }
 
+    // TODO(P3): Use UPDATE ... RETURNING for atomic claim instead of find() + update().
+    //   Multiple workers can pick up the same tasks. Dedup via cache is best-effort.
     async getMatureTasks(timestamp: number): Promise<CronTask<TId>[]> {
         const staleTimestamp = Date.now() - TWO_DAYS_MS;
 
@@ -216,33 +218,31 @@ export class PrismaAdapter<
     }
 
     async markTasksAsExecuted(tasks: CronTask<TId>[]): Promise<void> {
-        const taskIds = tasks.map(t => t.id).filter(Boolean);
-        if (!taskIds.length) return;
+        const tasksWithIds = tasks.filter(t => t.id);
+        if (!tasksWithIds.length) return;
 
-        await this.delegate.updateMany({
-            where: {id: {in: taskIds}},
-            data: {status: 'executed', updated_at: new Date()}
-        });
-    }
+        const now = new Date();
+        const hasAnyResult = tasksWithIds.some(t => t.execution_result !== undefined);
 
-    async markTasksAsFailed(tasks: CronTask<TId>[]): Promise<void> {
-        const taskIds = tasks.map(t => t.id).filter(Boolean);
-        if (!taskIds.length) return;
-
-        await this.delegate.updateMany({
-            where: {id: {in: taskIds}},
-            data: {status: 'failed', updated_at: new Date()}
-        });
-    }
-
-    async markTasksAsIgnored(tasks: CronTask<TId>[]): Promise<void> {
-        const taskIds = tasks.map(t => t.id).filter(Boolean);
-        if (!taskIds.length) return;
-
-        await this.delegate.updateMany({
-            where: {id: {in: taskIds}},
-            data: {status: 'ignored', updated_at: new Date()}
-        });
+        if (hasAnyResult) {
+            // Any task carries a result → unified $transaction for entire batch (1 round-trip)
+            await this.prismaClient.$transaction(
+                tasksWithIds.map(t => this.delegate.update({
+                    where: {id: t.id},
+                    data: {
+                        status: 'executed',
+                        updated_at: now,
+                        ...(t.execution_result !== undefined && {execution_result: t.execution_result})
+                    }
+                }))
+            );
+        } else {
+            // No results in batch → single updateMany (1 server op, 1 round-trip)
+            await this.delegate.updateMany({
+                where: {id: {in: tasksWithIds.map(t => t.id!)}},
+                data: {status: 'executed', updated_at: now}
+            });
+        }
     }
 
     async getTasksByIds(taskIds: TId[]): Promise<CronTask<TId>[]> {
