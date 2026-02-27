@@ -24,6 +24,7 @@
     "typecheck": "turbo typecheck --filter='./packages/*' --filter='./lib/*'",
     "typecheck:packages": "turbo typecheck --filter='./packages/*'",
     "typecheck:lib": "turbo typecheck --filter='./lib/*'",
+    "typecheck:plugins": "turbo typecheck --filter='./plugins/*' --filter='./plugins/seo/*' --filter='./plugins/internal/*'",
     "publint": "turbo publint --filter='./packages/*' --filter='./lib/*'",
     "app:dev": "turbo dev --filter='./apps/test-app'",
     "app:build": "turbo build --filter='./apps/test-app'"

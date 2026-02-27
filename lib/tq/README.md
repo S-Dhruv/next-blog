@@ -12,6 +12,8 @@ Built on top of `@supergrowthai/mq` for flexible message queue backends.
 - **Queue Integration**: Works with any message queue backend via `@supergrowthai/mq`
 - **Named Exports**: Tree-shakable, explicit imports
 - **Fail-Fast Design**: Required dependencies enforce proper configuration
+- **Entity Projection**: Automatic entity-task status tracking for dashboards and orchestration
+- **Flow Orchestration**: Built-in fan-out/fan-in with barrier tracking, failure policies, and timeouts
 
 ## Installation
 
@@ -51,10 +53,10 @@ taskQueue.register('email-queue', 'send-email', {
     async onTask(task, actions) {
         try {
             await sendEmail(task.payload.to, task.payload.subject);
-            actions.success(task);
+            actions.success(task, { messageId: 'abc-123' });
         } catch (error) {
             console.error('Failed to send email:', error);
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 });
@@ -164,7 +166,7 @@ const emailExecutor: ISingleTaskNonParallel<EmailData> = {
             actions.success(task);
         } catch (error) {
             console.error('Email sending failed:', error);
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -189,10 +191,10 @@ const imageProcessorExecutor: ISingleTaskParallel<ImageData> = {
     async onTask(task, actions) {
         try {
             await processImage(task.payload.imageUrl, task.payload.filters);
-            actions.success(task);
+            actions.success(task, { processedUrl: task.payload.imageUrl });
         } catch (error) {
             console.error('Image processing failed:', error);
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -221,7 +223,7 @@ const batchProcessorExecutor: IMultiTaskExecutor<BatchData> = {
                 actions.success(task);
             } catch (error) {
                 console.error('Batch item failed:', error);
-                actions.fail(task);
+                actions.fail(task, error instanceof Error ? error : String(error));
 
                 // Optionally add retry tasks
                 if ((task.retries || 0) < 3) {
@@ -245,13 +247,30 @@ For long-running tasks that might exceed normal timeouts:
 
 ```typescript
 import {AsyncTaskManager} from '@supergrowthai/tq';
+import type {AsyncTaskManagerOptions} from '@supergrowthai/tq';
 
-// Set up async task manager
-const asyncTaskManager = new AsyncTaskManager(5);  // maxTasks parameter
+// Simple usage (backward-compatible)
+const asyncTaskManager = new AsyncTaskManager(10); // maxTasks shorthand
 
-// Graceful shutdown with AbortSignal
-const abortController = new AbortController();
-await asyncTaskManager.shutdown(abortController.signal);
+// Full options
+const asyncTaskManager = new AsyncTaskManager({
+    maxTasks: 10,
+    sweepIntervalMs: 5000,          // How often to check for hung tasks (default: 5s)
+    defaultMaxDurationMs: 600000,   // Max task duration before eviction (default: 10 min)
+    shutdownGracePeriodMs: 15000,   // Grace period on shutdown (default: 10s)
+    onTaskTimeout: (taskId, task, durationMs) => {
+        console.error(`Task ${taskId} (${task.type}) timed out after ${durationMs}ms`);
+    }
+});
+
+// Observability
+const metrics = asyncTaskManager.getMetrics();
+// { activeTaskCount, totalHandedOff, totalCompleted, totalRejected,
+//   totalTimedOut, oldestTaskMs, maxTasks, utilizationPercent }
+
+// Graceful shutdown — returns ShutdownResult
+const result = await asyncTaskManager.shutdown(abortController.signal);
+console.log(`Completed: ${result.completedDuringGrace}, Abandoned: ${result.abandonedTaskIds}`);
 
 const heavyProcessingExecutor: ISingleTaskNonParallel<ProcessingData> = {
     multiple: false,
@@ -268,9 +287,9 @@ const heavyProcessingExecutor: ISingleTaskNonParallel<ProcessingData> = {
         try {
             // This might take a very long time
             const result = await performHeavyComputation(task.payload);
-            actions.success(task);
+            actions.success(task, result);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -284,6 +303,12 @@ const taskHandler = new TaskHandler(
     asyncTaskManager  // Now tasks can be handed off to async processing
 );
 ```
+
+Key features:
+- **Stale task sweep**: Periodically evicts tasks exceeding `defaultMaxDurationMs`
+- **Duplicate rejection**: Rejects handoff if the same task ID is already tracked
+- **Shutdown-aware gate**: Stops accepting new tasks once `shutdown()` is called
+- **Observability**: `getMetrics()` exposes utilization, counters, and oldest task age
 
 ## Lifecycle Callbacks
 
@@ -423,6 +448,258 @@ const taskHandler = new TaskHandler(
 | started_at     | Date     | When worker started      |
 | enabled_queues | string[] | Queues being processed   |
 
+## Entity Task Projection
+
+Track task lifecycle at the entity level without querying internal task tables. Useful for dashboards, customer-facing status pages, and flow orchestration.
+
+### How It Works
+
+Tasks can carry an `entity` binding — an external domain object (e.g., a user, order, or campaign) that the task operates on. When configured, tq automatically projects status transitions to your provider:
+
+```
+scheduled → processing → executed
+                       → failed
+```
+
+Projections are **non-fatal** — provider errors are logged but never disrupt task processing.
+
+### Binding an Entity to a Task
+
+```typescript
+await taskHandler.addTasks([{
+    type: 'generate-report',
+    queue_id: 'reports',
+    execute_at: new Date(),
+    payload: { reportType: 'monthly', userId: 'u_123' },
+
+    // Entity binding — ties this task to a domain object
+    entity: { id: 'u_123', type: 'user' },
+
+    // Entity tasks MUST have a persistent ID for projection keying.
+    // Use store_on_failure: true on the executor, or force_store: true here.
+}]);
+```
+
+**Fail-fast guarantee**: If a task has `entity` but no `id`, `buildProjection()` throws at runtime with an actionable error message pointing to `store_on_failure`, `force_store`, or manual ID assignment. This catches misconfiguration during development, not in production at 3 AM.
+
+### Implementing a Projection Provider
+
+```typescript
+import type {IEntityProjectionProvider, EntityTaskProjection} from '@supergrowthai/tq';
+
+class PostgresProjectionProvider implements IEntityProjectionProvider<string> {
+    async upsertProjections(entries: EntityTaskProjection<string>[]): Promise<void> {
+        // Batch upsert to your projection table
+        await db.query(`
+            INSERT INTO entity_task_projections
+                (task_id, entity_id, entity_type, task_type, queue_id, status,
+                 payload, error, result, created_at, updated_at)
+            VALUES ${entries.map((_, i) => `($${i * 11 + 1}, ...)`).join(', ')}
+            ON CONFLICT (task_id) DO UPDATE SET
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                result = EXCLUDED.result,
+                updated_at = EXCLUDED.updated_at
+        `, entries.flatMap(e => [
+            e.task_id, e.entity_id, e.entity_type, e.task_type, e.queue_id,
+            e.status, e.payload, e.error, e.result, e.created_at, e.updated_at
+        ]));
+    }
+}
+```
+
+### Wiring It Up
+
+```typescript
+const taskHandler = new TaskHandler(
+    messageQueue,
+    taskQueue,
+    databaseAdapter,
+    cacheAdapter,
+    asyncTaskManager,
+    notificationProvider,
+    {
+        lifecycleProvider: myLifecycleProvider,
+        workerProvider: myWorkerProvider,
+
+        // RFC-003: Entity projection
+        entityProjection: new PostgresProjectionProvider(),
+        entityProjectionConfig: {
+            includePayload: false  // default; set true to persist payload in projections
+        }
+    }
+);
+```
+
+### Projection Lifecycle
+
+| Event | Status | When | Where |
+|-------|--------|------|-------|
+| Task added | `scheduled` | After `addTasks()` completes (all 3 routing paths) | `TaskHandler.addTasks` |
+| Worker picks up task | `processing` | Before executor runs (first attempt only, not retries) | `TaskRunner.run` |
+| Task succeeds | `executed` | After `markTasksAsSuccess` | `TaskHandler.postProcessTasks` / `AsyncActions` |
+| Task exhausts retries | `failed` | After `markTasksAsFailed` or discard | `TaskHandler.postProcessTasks` / `AsyncActions` |
+
+### EntityTaskProjection Shape
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `task_id` | `ID` | Task identifier (required — fail-fast if missing) |
+| `entity_id` | `string` | External entity identifier |
+| `entity_type` | `string` | Entity type (e.g., `'user'`, `'order'`) |
+| `task_type` | `string` | Task type identifier |
+| `queue_id` | `string` | Queue the task belongs to |
+| `status` | `'scheduled' \| 'processing' \| 'executed' \| 'failed'` | Current lifecycle status |
+| `payload` | `unknown?` | Task payload (only if `includePayload: true`) |
+| `error` | `string?` | Error message (only on `failed` status) |
+| `result` | `unknown?` | Execution result (only on `executed` status) |
+| `created_at` | `Date` | Task creation time |
+| `updated_at` | `Date` | Projection update time |
+
+### Design Decisions
+
+- **Non-fatal**: Provider errors are caught and logged. Task processing is never interrupted by projection failures.
+- **Batch-efficient**: All projections within a processing batch are collected and sent in a single `upsertProjections()` call.
+- **No retry-spam**: `processing` projection is only emitted on the first attempt, not on retries.
+- **Async-aware**: Async tasks (via `handoffTimeout`) emit terminal projections from `AsyncActions` when the promise resolves.
+- **Fail-fast on misconfiguration**: Entity tasks without an ID throw immediately with an actionable fix, rather than silently producing broken projections.
+
+## Flow Orchestration
+
+Fan-out/fan-in flow orchestration built into the task pipeline. Dispatch N parallel steps, track completion via a barrier, and automatically dispatch a join task when all steps complete.
+
+### How It Works
+
+```
+actions.startFlow()
+  -> fan-out: [images.resize, video.transcode, metadata.validate]
+  -> barrier: tracks completion of all 3 steps
+  -> fan-in:  item.process.completed (receives merged results)
+```
+
+Steps execute as normal tasks with no awareness of the flow. The framework handles barrier tracking and join dispatch via `FlowMiddleware` in the post-processing pipeline.
+
+### Starting a Flow
+
+```typescript
+const flowId = actions.startFlow({
+    steps: [
+        { type: 'images.resize', queue_id: 'media', payload: { imageId: 'img_1' } },
+        { type: 'video.transcode', queue_id: 'media', payload: { videoId: 'vid_1' } },
+        { type: 'metadata.validate', queue_id: 'default', payload: { itemId: 'item_1' } },
+    ],
+    config: {
+        join: { type: 'item.process.completed', queue_id: 'default' },
+        failure_policy: 'continue',  // or 'abort'
+        timeout_ms: 300000,          // optional — 5 minute deadline
+        entity: { id: 'item-123', type: 'Item' },  // optional — flow-level entity tracking
+    }
+});
+// flowId is a UUID identifying this flow instance
+```
+
+### Join Task
+
+When the barrier is met, a join task is dispatched with aggregated results in `payload.flow_results`:
+
+```typescript
+taskQueue.register('default', 'item.process.completed', {
+    multiple: false,
+    parallel: false,
+    default_retries: 2,
+    store_on_failure: true,
+
+    async onTask(task, actions) {
+        const results: FlowResults = task.payload.flow_results;
+        // results.steps = [
+        //   { step_index: 0, status: 'success', result: { thumbnails: [...] } },
+        //   { step_index: 1, status: 'success', result: { video_url: '...' } },
+        //   { step_index: 2, status: 'fail', error: 'Validation timeout' }
+        // ]
+
+        if (results.steps.every(s => s.status === 'success')) {
+            actions.success(task, { merged: true });
+        } else {
+            actions.fail(task, 'Some steps failed');
+        }
+    }
+});
+```
+
+### Failure Policies
+
+| Policy | Behavior |
+|--------|----------|
+| `continue` (default) | Failed steps still decrement the barrier. Join receives mixed results. Join executor decides what to do. |
+| `abort` | On first final failure, join is dispatched immediately with partial results and `aborted: true`. Remaining step completions become no-ops. |
+
+### Timeout
+
+When `timeout_ms` is set, a sentinel task is created that fires after the deadline. If the barrier hasn't been met by then, the join is dispatched with partial results and `timed_out: true`. If the barrier was already met, the timeout is a no-op.
+
+### Barrier Provider
+
+Flow barrier tracking requires an `IFlowBarrierProvider`. An `InMemoryFlowBarrierProvider` is included for testing. For production, implement a Redis-backed provider with atomic Lua scripts for deduplication (HSETNX) and batch decrement.
+
+```typescript
+import { IFlowBarrierProvider, BarrierDecrementResult, FlowStepResult } from '@supergrowthai/tq';
+
+class RedisFlowBarrierProvider implements IFlowBarrierProvider {
+    async initBarrier(flowId: string, totalSteps: number): Promise<void> { /* ... */ }
+    async batchDecrementAndCheck(flowId: string, results: FlowStepResult[]): Promise<BarrierDecrementResult> { /* ... */ }
+    async getStepResults(flowId: string): Promise<FlowStepResult[]> { /* ... */ }
+    async markAborted(flowId: string): Promise<boolean> { /* ... */ }
+    async isComplete(flowId: string): Promise<boolean> { /* ... */ }
+}
+```
+
+`BarrierDecrementResult.remaining`: `0` = barrier met (dispatch join), `>0` = steps pending, `-1` = already complete/aborted (no-op).
+
+### Wiring It Up
+
+```typescript
+import { FlowMiddleware, InMemoryFlowBarrierProvider } from '@supergrowthai/tq';
+
+const barrierProvider = new InMemoryFlowBarrierProvider(); // or your Redis impl
+const flowMiddleware = new FlowMiddleware(barrierProvider, generateId);
+
+const taskHandler = new TaskHandler(
+    messageQueue,
+    taskQueue,
+    databaseAdapter,
+    cacheAdapter,
+    asyncTaskManager,
+    notificationProvider,
+    {
+        lifecycleProvider: myLifecycleProvider,
+        workerProvider: myWorkerProvider,
+        entityProjection: myProjectionProvider,
+        flowMiddleware,  // RFC-002
+    }
+);
+```
+
+### Entity Tracking on Flows
+
+When `config.entity` is provided, the flow lifecycle is projected through the same entity projection system (RFC-003):
+
+| Event | Projection Status |
+|-------|-------------------|
+| `startFlow()` called | `processing` (keyed on `flow_id`) |
+| Join task succeeds | `executed` |
+| Join task fails / abort / timeout | `failed` |
+
+Individual step tasks do **not** carry `CronTask.entity` — entity tracking is at the flow level, avoiding N separate projection rows per step.
+
+### Design Decisions
+
+- **Flow metadata in `metadata.flow_meta`**: User payload is never polluted. Framework data lives in the `metadata` namespace alongside `log_context` (RFC-005).
+- **Batch barrier operations**: Multiple steps from the same flow completing in one processing cycle are batched into a single barrier call.
+- **HSETNX deduplication**: At-least-once MQ delivery means duplicate step completions are safely ignored via set-if-not-exists semantics.
+- **FlowMiddleware returns data, doesn't write**: Returns `{ joinTasks, projections }` to `TaskHandler`, which owns all writes. Clean separation of concerns.
+- **Nested flows**: A join executor can call `actions.startFlow()` to start another flow. Flow IDs are independent UUIDs — no special handling needed.
+- **IMultiTaskExecutor optimization**: Flow steps of the same type in the same processing cycle batch into a single executor call automatically via `TaskRunner`'s existing grouping logic.
+
 ## Error Handling and Retries
 
 ```typescript
@@ -437,7 +714,7 @@ const resilientExecutor: ISingleTaskNonParallel<ApiCallData> = {
             const response = await callExternalAPI(task.payload.endpoint, task.payload.data);
 
             if (response.status === 200) {
-                actions.success(task);
+                actions.success(task, { status: response.status });
             } else {
                 throw new Error(`API returned status: ${response.status}`);
             }
@@ -455,12 +732,49 @@ const resilientExecutor: ISingleTaskNonParallel<ApiCallData> = {
                     execute_at: new Date(Date.now() + retryDelay)
                 }]);
             } else {
-                actions.fail(task);
+                actions.fail(task, error instanceof Error ? error : String(error), { attempt: currentRetries + 1 });
             }
         }
     }
 };
 ```
+
+## Task Result Persistence
+
+Executors can persist structured results on task completion or failure via `ExecutorActions`:
+
+```typescript
+// Store result on success — saved to task.execution_result (256 KB limit)
+actions.success(task, { outputUrl: 'https://cdn.example.com/result.pdf', pages: 42 });
+
+// Store error details on failure — saved to task.execution_stats
+actions.fail(task, new Error('Upstream timeout'), { endpoint: '/api/render', latencyMs: 30000 });
+```
+
+Results are stored by the `TaskRunner` and persisted via your `ITaskStorageAdapter`. Oversized results (>256 KB serialized) are silently dropped to protect storage.
+
+### Executor-Level Partition Key
+
+Executors can declare a `getPartitionKey` function to control Kinesis partition routing for ordering guarantees:
+
+```typescript
+taskQueue.register('order-queue', 'process-order', {
+    multiple: false,
+    parallel: false,
+    default_retries: 3,
+    store_on_failure: true,
+
+    // All tasks for the same user land on the same Kinesis shard
+    getPartitionKey: (task) => task.payload.user_id,
+
+    async onTask(task, actions) {
+        await processOrder(task.payload);
+        actions.success(task, { orderId: task.payload.order_id });
+    }
+});
+```
+
+The returned value is set as `partition_key` on the message, overriding the default Kinesis partition routing.
 
 ## Working with Different Queue Providers
 
@@ -522,7 +836,11 @@ kinesisTaskQueue.register('real-time', 'notification', notificationExecutor);
 Full TypeScript definitions with generic task types:
 
 ```typescript
-import type {TaskExecutor, ExecutorActions, CronTask} from '@supergrowthai/tq';
+import type {
+    TaskExecutor, ExecutorActions, CronTask, AsyncTaskManagerOptions, ShutdownResult,
+    IEntityProjectionProvider, EntityTaskProjection, EntityProjectionConfig,
+    StartFlowInput, FlowResults, FlowMeta, IFlowBarrierProvider
+} from '@supergrowthai/tq';
 
 // Define your task data type
 interface EmailTaskData {
@@ -550,7 +868,7 @@ const typedExecutor: ISingleTaskNonParallel<EmailTaskData> = {
             await sendEmail(task.payload);
             actions.success(task);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -597,7 +915,7 @@ await mongoClient.connect();
 
 const messageQueue = new ProductionMongoDBQueue(cacheProvider, mongoClient);
 const taskQueue = new TaskQueuesManager(messageQueue);
-const asyncTaskManager = new AsyncTaskManager(10); // maxTasks: 10 concurrent async tasks
+const asyncTaskManager = new AsyncTaskManager({ maxTasks: 10 }); // See AsyncTaskManagerOptions
 
 const taskHandler = new TaskHandler(
     messageQueue,
@@ -642,7 +960,7 @@ const idempotentExecutor: ISingleTaskNonParallel<UserUpdateData> = {
             await updateUser(task.payload.userId, task.payload.updates);
             actions.success(task);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         }
     }
 };
@@ -668,7 +986,7 @@ const apiExecutor: ISingleTaskParallel<ApiTaskData> = {
             const result = await callAPI(task.payload);
             actions.success(task);
         } catch (error) {
-            actions.fail(task);
+            actions.fail(task, error instanceof Error ? error : String(error));
         } finally {
             rateLimiter.release();
         }

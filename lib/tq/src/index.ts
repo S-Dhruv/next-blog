@@ -30,6 +30,16 @@ export * from "./core/lifecycle.js";
 // Task processor types
 export * from "./core/task-processor-types.js";
 
+// Log context (RFC-005)
+export {runWithLogContext, getLogContext} from "./core/log-context.js";
+export type {LogStore} from "./core/log-context.js";
+
+// Entity projection (RFC-003)
+export * from "./core/entity/index.js";
+
+// Flow orchestration (RFC-002)
+export * from "./core/flow/index.js";
+
 // Utilities
 export * from "./utils/task-id-gen.js";
 
