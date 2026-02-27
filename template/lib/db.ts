@@ -19,7 +19,7 @@ if (mongoUrl) {
 
     dbProvider = async () => {
         const client = await clientPromise;
-        const db = new adapters.MongoDBAdapter(process.env.MONGO_DB_NAME || "next-blog", client);
+        const db = new adapters.MongoDBAdapter("next-blog", client);
 
         if(process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD ) {
             if (!adminCreatedPromise) {
