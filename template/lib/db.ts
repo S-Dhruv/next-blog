@@ -2,6 +2,12 @@ import * as adapters from "@supergrowthai/next-blog/adapters";
 import type {DatabaseAdapter} from "@supergrowthai/next-blog";
 import {MongoClient} from "mongodb";
 import {createAdminUser} from "./createAdmin";
+import crypto from "crypto";
+
+// Auto-generate a SESSION_SECRET if one isn't provided
+if (!process.env.SESSION_SECRET) {
+    process.env.SESSION_SECRET = crypto.randomBytes(32).toString("hex");
+}
 
 const mongoUrl = process.env.MONGODB_URI;
 const useMongo = Boolean(mongoUrl);
