@@ -6,9 +6,7 @@ This is a starter template for deploying [Next-Blog](https://github.com/captadex
 
 Click the button below to deploy your own instance of Next-Blog to Vercel:
 
-// force deployment
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog-base&project-name=next-blog-starter&repository-name=next-blog-starter&install-command=bun+install&build-command=bun+run+build&teamSlug=s-dhruvs-projects&products=%5B%7B%22type%22%3A%22integration%22%2C%22protocol%22%3A%22storage%22%2C%22productSlug%22%3A%22atlas%22%2C%22integrationSlug%22%3A%22mongodbatlas%22%7D%5D&skippable-integrations=1&env=MONGODB_DB_NAME%2CSESSION_SECRET%2CADMIN_EMAIL&envDescription=MONGODB_DB_NAME%3A+name+of+your+db+(e.g.+next-blog)+%7C+SESSION_SECRET%3A+any+random+string+%7C+ADMIN_EMAIL%3A+your+email&envLink=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog-base%23readme)
-(In-progress)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog&project-name=next-blog-starter&repository-name=next-blog-starter&root-directory=template&install-command=bun+install&build-command=bun+run+build&teamSlug=s-dhruvs-projects&products=%5B%7B%22type%22%3A%22integration%22%2C%22protocol%22%3A%22storage%22%2C%22productSlug%22%3A%22atlas%22%2C%22integrationSlug%22%3A%22mongodbatlas%22%7D%5D&skippable-integrations=1&env=NAME,DESCRIPTION,ADMIN_EMAIL,ADMIN_PASSWORD,ADMIN_USERNAME,ADMIN_NAME&envDescription=NAME%3A+Blog+name%7C+DESCRIPTION%3A+Short+blog+description%7C+SESSION_SECRET%3A+Random+string%7C+ADMIN_EMAIL%3A+Admin+email%7C+ADMIN_PASSWORD%3A+Admin+password%7C+ADMIN_USERNAME%3A+Optional+(default+admin)%7C+ADMIN_NAME%3A+Optional+display+name&envLink=https%3A%2F%2Fgithub.com%2FS-Dhruv%2Fnext-blog%23readme)
 
 ## 📋 Environment Variables
 
